@@ -2,6 +2,7 @@ package com.pdg.sharestack;
 
 import android.content.ContentProvider;
 import android.content.ContentValues;
+import android.content.Context;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
@@ -38,6 +39,8 @@ public final class StackProvider extends ContentProvider {
 
     private File fileFor(Uri uri) {
         boolean sharedFile = uri.getPathSegments().size() == 2 && "shared".equals(uri.getPathSegments().get(0));
-        return new File(requireContext().getFilesDir(), (sharedFile ? "shared/" : "items/") + uri.getLastPathSegment());
+        Context context = getContext();
+        if (context == null) throw new IllegalStateException("Provider context is unavailable");
+        return new File(context.getFilesDir(), (sharedFile ? "shared/" : "items/") + uri.getLastPathSegment());
     }
 }

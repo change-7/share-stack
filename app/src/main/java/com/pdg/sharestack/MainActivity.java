@@ -2,6 +2,7 @@ package com.pdg.sharestack;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.Dialog;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -54,7 +55,10 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 public final class MainActivity extends Activity {
     private static final String PREFS = "stack";
@@ -94,10 +98,23 @@ public final class MainActivity extends Activity {
     @Override public void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        reloadItems();
+        requestBadgePermissionIfNeeded();
+    }
+
+    @Override public void onResume() {
+        super.onResume();
+        if (list != null) reloadItems();
+    }
+
+    private void reloadItems() {
+        selectedItemIds.clear();
+        for (CheckBox selection : selections) {
+            if (selection.isChecked()) selectedItemIds.add((String) selection.getTag());
+        }
         items.clear();
         loadItems();
         render();
-        requestBadgePermissionIfNeeded();
     }
 
     private void buildUi() {
@@ -260,6 +277,7 @@ public final class MainActivity extends Activity {
         render();
     }
 
+    @SuppressWarnings("deprecation")
     private boolean handleIncoming(Intent intent) {
         if (!isIncomingShare(intent)) return false;
         boolean added = false;
@@ -267,10 +285,14 @@ public final class MainActivity extends Activity {
         if (text != null && !text.isEmpty()) { addText(text); added = true; }
         ArrayList<Uri> uris = new ArrayList<>();
         if (Intent.ACTION_SEND_MULTIPLE.equals(intent.getAction())) {
-            ArrayList<Uri> multiple = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri.class);
+            ArrayList<Uri> multiple = android.os.Build.VERSION.SDK_INT >= 33
+                ? intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri.class)
+                : intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
             if (multiple != null) uris.addAll(multiple);
         } else {
-            Uri stream = intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class);
+            Uri stream = android.os.Build.VERSION.SDK_INT >= 33
+                ? intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class)
+                : intent.getParcelableExtra(Intent.EXTRA_STREAM);
             if (stream != null) uris.add(stream);
         }
         if (intent.getClipData() != null) for (int i = 0; i < intent.getClipData().getItemCount(); i++) {
@@ -441,22 +463,25 @@ public final class MainActivity extends Activity {
     }
 
     private void addListItem(StackItem item) {
-        LinearLayout card = new LinearLayout(this);
-        card.setGravity(Gravity.CENTER_VERTICAL);
+        FrameLayout card = new FrameLayout(this);
         card.setPadding(dp(8), dp(8), dp(12), dp(8));
         card.setBackground(roundedBackground(SURFACE, BORDER, 18));
         card.setElevation(dp(2));
 
+        LinearLayout content = new LinearLayout(this);
+        content.setGravity(Gravity.CENTER_VERTICAL);
+
         FrameLayout previewArea = new FrameLayout(this);
+        previewArea.setBackground(roundedBackground(0xfff1f3f4, 0, 12));
+        previewArea.setClipToOutline(true);
         previewArea.addView(previewFor(item), new FrameLayout.LayoutParams(-1, -1));
         CheckBox box = newSelectionBox(item);
-        previewArea.addView(box, new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.TOP | Gravity.END));
-        card.addView(previewArea, new LinearLayout.LayoutParams(dp(108), dp(76)));
+        content.addView(previewArea, new LinearLayout.LayoutParams(dp(108), dp(76)));
 
         LinearLayout details = new LinearLayout(this);
         details.setOrientation(LinearLayout.VERTICAL);
         details.setGravity(Gravity.CENTER_VERTICAL);
-        details.setPadding(dp(12), 0, 0, 0);
+        details.setPadding(dp(12), 0, dp(48), 0);
         TextView name = new TextView(this);
         name.setText(item.name);
         name.setTextSize(16);
@@ -471,7 +496,11 @@ public final class MainActivity extends Activity {
         type.setPadding(0, dp(4), 0, 0);
         details.addView(name);
         details.addView(type);
-        card.addView(details, new LinearLayout.LayoutParams(0, -1, 1));
+        content.addView(details, new LinearLayout.LayoutParams(0, -1, 1));
+        card.addView(content, new FrameLayout.LayoutParams(-1, -1));
+        FrameLayout.LayoutParams boxParams = new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.TOP | Gravity.END);
+        boxParams.setMargins(0, -dp(12), -dp(12), 0);
+        card.addView(box, boxParams);
         card.setOnClickListener(v -> box.setChecked(!box.isChecked()));
 
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(92));
@@ -649,6 +678,9 @@ public final class MainActivity extends Activity {
 
     private void styleActionButton(Button button, int fill, int textColor, int stroke, int radius, int textSize) {
         styleButton(button, fill, textColor, stroke, radius, textSize);
+        button.setStateListAnimator(null);
+        button.setElevation(0);
+        button.setTranslationZ(0);
         button.setSingleLine(true);
         button.setMaxLines(1);
         button.setEllipsize(TextUtils.TruncateAt.END);
@@ -672,8 +704,8 @@ public final class MainActivity extends Activity {
             viewButton.setContentDescription(listMode ? "카드 보기로 전환" : "목록 보기로 전환");
         }
         if (selectionSummary != null) {
-            selectionSummary.setText(selectedCount == 0 ? "선택 필요" : selectedCount + "개 선택됨");
-            selectionSummary.setTextColor(selectedCount == 0 ? MUTED : PRIMARY_DARK);
+            selectionSummary.setText(selectedCount == 0 ? items.size() + "개" : selectedCount + "개 선택됨");
+            selectionSummary.setTextColor(PRIMARY_DARK);
         }
         if (shareButton != null) {
             boolean canShare = selectedCount > 0;
@@ -744,25 +776,68 @@ public final class MainActivity extends Activity {
     }
 
     private void shareSelected() {
-        List<StackItem> selected = selected(); if (selected.isEmpty()) { toast("공유할 항목을 선택하세요"); return; }
+        List<StackItem> selected = selected();
+        if (selected.isEmpty()) { toast("공유할 항목을 선택하세요"); return; }
+        int fileCount = 0;
+        for (StackItem item : selected) if (!"text/plain".equals(item.mimeType)) fileCount++;
+        if (fileCount > 1) {
+            boolean hasText = !selectedText(selected).isEmpty();
+            new AlertDialog.Builder(this)
+                .setTitle("공유 방식")
+                .setMessage(hasText
+                    ? "파일은 공유 화면으로 보내고 텍스트는 클립보드에 복사합니다. 대상 앱이 여러 파일을 받지 못하면 ZIP으로 공유하세요."
+                    : "한번에 공유가 권장됩니다. 대상 앱이 여러 파일을 받지 못하면 ZIP으로 공유하세요.")
+                .setPositiveButton("한번에 공유", (dialog, which) -> shareItems(selected, false))
+                .setNeutralButton("ZIP으로 공유", (dialog, which) -> shareItems(selected, true))
+                .setNegativeButton("취소", null)
+                .show();
+            return;
+        }
+        shareItems(selected, false);
+    }
+
+    private void shareItems(List<StackItem> selected, boolean zipFiles) {
         boolean clearAfterShare = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(CLEAR_STACK_AFTER_SHARE, false);
         ArrayList<Uri> uris = new ArrayList<>();
         ArrayList<StackItem> sharedFiles = new ArrayList<>();
+        String text = selectedText(selected);
         for (StackItem item : selected) if (!"text/plain".equals(item.mimeType)) {
             sharedFiles.add(item);
-            String id = clearAfterShare ? copyForSharing(item) : item.id;
-            uris.add(Uri.parse("content://com.pdg.sharestack.items/" + (clearAfterShare ? "shared/" : "") + id + "?name=" + Uri.encode(item.name) + "&type=" + Uri.encode(item.mimeType)));
+        }
+        if (sharedFiles.isEmpty()) {
+            if (text.isEmpty()) { toast("공유할 내용을 찾을 수 없습니다"); return; }
+            copyTextToClipboard(text);
+            toast("텍스트를 클립보드에 복사했습니다");
+            if (clearAfterShare) clearStack();
+            return;
+        }
+        String sendType;
+        if (zipFiles && sharedFiles.size() > 1) {
+            Uri zipUri = createZipForSharing(sharedFiles);
+            if (zipUri == null) return;
+            uris.add(zipUri);
+            sendType = "application/zip";
+        } else {
+            for (StackItem item : sharedFiles) {
+                String id = clearAfterShare ? copyForSharing(item) : item.id;
+                if (id == null) return;
+                uris.add(contentUri(clearAfterShare ? "shared/" : "", id, item.name, item.mimeType));
+            }
+            sendType = uris.isEmpty() ? "text/plain" : commonType(sharedFiles);
         }
         Intent send = new Intent(uris.size() <= 1 ? Intent.ACTION_SEND : Intent.ACTION_SEND_MULTIPLE);
-        send.setType(uris.isEmpty() ? "text/plain" : commonType(sharedFiles));
-        String text = selectedText(selected);
-        if (!text.isEmpty()) send.putExtra(Intent.EXTRA_TEXT, text);
-        if (!uris.isEmpty()) send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).setClipData(ClipData.newRawUri("Share Stack items", uris.get(0)));
+        send.setType(sendType);
+        if (!uris.isEmpty()) {
+            ClipData clipData = ClipData.newRawUri("Share Stack items", uris.get(0));
+            for (int index = 1; index < uris.size(); index++) clipData.addItem(new ClipData.Item(uris.get(index)));
+            send.setClipData(clipData);
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        }
         if (uris.size() == 1) send.putExtra(Intent.EXTRA_STREAM, uris.get(0));
         else if (uris.size() > 1) send.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
-        if (!text.isEmpty() && !uris.isEmpty()) {
-            ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Share Stack", text));
-            toast("텍스트도 클립보드에 복사했습니다. 대상 앱에서 붙여넣으세요.");
+        if (!text.isEmpty()) {
+            copyTextToClipboard(text);
+            toast("텍스트를 복사했습니다. 대상 앱에서 붙여넣으세요.");
         }
         startActivity(Intent.createChooser(send, "선택 항목 공유"));
         if (clearAfterShare) {
@@ -772,14 +847,29 @@ public final class MainActivity extends Activity {
 
     private String commonType(List<StackItem> selected) {
         String type = selected.get(0).mimeType;
-        for (StackItem item : selected) if (!type.equals(item.mimeType)) return "*/*";
+        boolean exactMatch = true;
+        int slash = type.indexOf('/');
+        if (slash <= 0) return "*/*";
+        String family = type.substring(0, slash);
+        for (StackItem item : selected) {
+            if (!type.equals(item.mimeType)) exactMatch = false;
+            int itemSlash = item.mimeType.indexOf('/');
+            if (itemSlash <= 0 || !family.equals(item.mimeType.substring(0, itemSlash))) return "*/*";
+        }
+        if (!exactMatch) return family + "/*";
         return type;
     }
 
     private void copySelectedText() {
         String text = selectedText(selected());
         if (text.isEmpty()) { toast("선택한 항목에 텍스트가 없습니다"); return; }
-        ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Share Stack", text)); toast("텍스트를 클립보드에 복사했습니다");
+        copyTextToClipboard(text);
+        toast("텍스트를 클립보드에 복사했습니다");
+    }
+
+    private void copyTextToClipboard(String text) {
+        ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE))
+            .setPrimaryClip(ClipData.newPlainText("Share Stack", text));
     }
 
     private String selectedText(List<StackItem> selected) {
@@ -813,8 +903,40 @@ public final class MainActivity extends Activity {
             while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
             return id;
         } catch (IOException exception) {
-            throw new IllegalStateException("공유 파일을 준비할 수 없습니다", exception);
+            sharedFile.delete();
+            toast("공유 파일을 준비할 수 없습니다");
+            return null;
         }
+    }
+
+    private Uri createZipForSharing(List<StackItem> files) {
+        String id = UUID.randomUUID().toString() + ".zip";
+        File zipFile = new File(getFilesDir(), "shared/" + id);
+        zipFile.getParentFile().mkdirs();
+        try (ZipOutputStream zip = new ZipOutputStream(new FileOutputStream(zipFile))) {
+            byte[] buffer = new byte[8192];
+            for (int index = 0; index < files.size(); index++) {
+                StackItem item = files.get(index);
+                String safeName = item.name.replace('/', '_').replace('\\', '_').trim();
+                if (safeName.isEmpty()) safeName = "file";
+                zip.putNextEntry(new ZipEntry(String.format(Locale.US, "%02d_%s", index + 1, safeName)));
+                try (FileInputStream input = new FileInputStream(itemFile(item.id))) {
+                    int count;
+                    while ((count = input.read(buffer)) != -1) zip.write(buffer, 0, count);
+                }
+                zip.closeEntry();
+            }
+            return contentUri("shared/", id, "ShareStack-files.zip", "application/zip");
+        } catch (IOException exception) {
+            zipFile.delete();
+            toast("ZIP 파일을 만들 수 없습니다");
+            return null;
+        }
+    }
+
+    private Uri contentUri(String directory, String id, String name, String type) {
+        return Uri.parse("content://com.pdg.sharestack.items/" + directory + id
+            + "?name=" + Uri.encode(name) + "&type=" + Uri.encode(type));
     }
 
     private void loadItems() {

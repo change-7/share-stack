@@ -46,6 +46,7 @@ final class StackStore {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(ITEMS, data.toString()).commit();
     }
 
+    @SuppressWarnings("deprecation")
     static int receive(Context context, Intent intent) {
         ArrayList<StackItem> items = load(context);
         boolean added = false;
@@ -61,10 +62,14 @@ final class StackStore {
 
         ArrayList<Uri> uris = new ArrayList<>();
         if (Intent.ACTION_SEND_MULTIPLE.equals(intent.getAction())) {
-            ArrayList<Uri> multiple = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri.class);
+            ArrayList<Uri> multiple = android.os.Build.VERSION.SDK_INT >= 33
+                ? intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri.class)
+                : intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
             if (multiple != null) uris.addAll(multiple);
         } else {
-            Uri stream = intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class);
+            Uri stream = android.os.Build.VERSION.SDK_INT >= 33
+                ? intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class)
+                : intent.getParcelableExtra(Intent.EXTRA_STREAM);
             if (stream != null) uris.add(stream);
         }
         if (intent.getClipData() != null) {

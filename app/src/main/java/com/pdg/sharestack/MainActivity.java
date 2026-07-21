@@ -871,10 +871,10 @@ public final class MainActivity extends Activity {
             copyTextToClipboard(text);
             toast("텍스트를 복사했습니다. 대상 앱에서 붙여넣으세요.");
         }
-        startActivity(Intent.createChooser(send, "선택 항목 공유"));
-        if (clearAfterShare) {
-            clearStack();
-        }
+        Intent chooser = clearAfterShare
+            ? Intent.createChooser(send, "선택 항목 공유", ShareSelectionReceiver.forItems(this, selected))
+            : Intent.createChooser(send, "선택 항목 공유");
+        startActivity(chooser);
     }
 
     private String commonType(List<StackItem> selected) {

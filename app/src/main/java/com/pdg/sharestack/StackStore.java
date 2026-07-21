@@ -49,6 +49,16 @@ final class StackStore {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(ITEMS, data.toString()).commit();
     }
 
+    static int remove(Context context, ArrayList<String> itemIds) {
+        ArrayList<StackItem> remaining = new ArrayList<>();
+        for (StackItem item : load(context)) {
+            if (itemIds.contains(item.id)) itemFile(context, item.id).delete();
+            else remaining.add(item);
+        }
+        save(context, remaining);
+        return remaining.size();
+    }
+
     @SuppressWarnings("deprecation")
     static int receive(Context context, Intent intent) {
         ArrayList<StackItem> items = load(context);

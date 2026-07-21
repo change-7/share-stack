@@ -56,8 +56,10 @@ public final class NotificationShareActivity extends Activity {
         if (uris.size() == 1) send.putExtra(Intent.EXTRA_STREAM, uris.get(0));
         else send.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
         if (!text.isEmpty()) copyText(text);
-        startActivity(Intent.createChooser(send, "선택 항목 공유"));
-        if (clearAfterShare) clearStack(items);
+        Intent chooser = clearAfterShare
+            ? Intent.createChooser(send, "선택 항목 공유", ShareSelectionReceiver.forItems(this, items))
+            : Intent.createChooser(send, "선택 항목 공유");
+        startActivity(chooser);
     }
 
     private String selectedText(List<StackItem> items) {

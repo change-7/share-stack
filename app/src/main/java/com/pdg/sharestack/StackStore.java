@@ -23,6 +23,7 @@ final class StackStore {
     static final String CLEAR_STACK_AFTER_SHARE = "clear_and_close_after_share";
     static final String OPEN_AFTER_RECEIVING = "open_after_receiving";
     static final String SHOW_NOTIFICATION_SHARE_ACTION = "show_notification_share_action";
+    static final String KEEP_STACK_NOTIFICATION = "keep_stack_notification";
 
     private StackStore() { }
 

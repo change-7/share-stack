@@ -206,7 +206,7 @@ public final class MainActivity extends Activity {
         title.setTextColor(INK);
         panel.addView(title);
         TextView description = new TextView(this);
-        description.setText("공유를 받을 때와 보낸 뒤 동작을 선택하세요.");
+        description.setText("공유와 알림 동작을 선택하세요.");
         description.setTextSize(14);
         description.setTextColor(MUTED);
         description.setPadding(0, dp(6), 0, dp(18));
@@ -238,7 +238,7 @@ public final class MainActivity extends Activity {
         receiveOptionParams.setMargins(0, dp(8), 0, 0);
         panel.addView(receiveOption, receiveOptionParams);
         CheckBox showNotificationShareAction = new CheckBox(this);
-        showNotificationShareAction.setText("알림에 전체 공유 버튼 표시");
+        showNotificationShareAction.setText("알림을 누르면 전체 공유");
         showNotificationShareAction.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE)
             .getBoolean(StackStore.SHOW_NOTIFICATION_SHARE_ACTION, false));
         showNotificationShareAction.setTextSize(15);
@@ -252,6 +252,21 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams notificationOptionParams = new LinearLayout.LayoutParams(-1, -2);
         notificationOptionParams.setMargins(0, dp(8), 0, 0);
         panel.addView(notificationOption, notificationOptionParams);
+        CheckBox keepStackNotification = new CheckBox(this);
+        keepStackNotification.setText("스택 알림 고정");
+        keepStackNotification.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean(StackStore.KEEP_STACK_NOTIFICATION, true));
+        keepStackNotification.setTextSize(15);
+        keepStackNotification.setTextColor(INK);
+        keepStackNotification.setButtonTintList(new ColorStateList(new int[][] {new int[] {android.R.attr.state_checked}, new int[] {}}, new int[] {PRIMARY, 0xffa2adbd}));
+        LinearLayout keepNotificationOption = new LinearLayout(this);
+        keepNotificationOption.setGravity(Gravity.CENTER_VERTICAL);
+        keepNotificationOption.setPadding(dp(10), dp(7), dp(8), dp(7));
+        keepNotificationOption.setBackground(roundedBackground(0xfff0f5ff, 0, 16));
+        keepNotificationOption.addView(keepStackNotification, new LinearLayout.LayoutParams(-1, dp(48)));
+        LinearLayout.LayoutParams keepNotificationOptionParams = new LinearLayout.LayoutParams(-1, -2);
+        keepNotificationOptionParams.setMargins(0, dp(8), 0, 0);
+        panel.addView(keepNotificationOption, keepNotificationOptionParams);
         LinearLayout buttons = new LinearLayout(this);
         buttons.setGravity(Gravity.CENTER_VERTICAL);
         buttons.setPadding(0, dp(20), 0, 0);
@@ -267,6 +282,7 @@ public final class MainActivity extends Activity {
                 .putBoolean(StackStore.CLEAR_STACK_AFTER_SHARE, clearAfterShare.isChecked())
                 .putBoolean(StackStore.OPEN_AFTER_RECEIVING, openAfterReceiving.isChecked())
                 .putBoolean(StackStore.SHOW_NOTIFICATION_SHARE_ACTION, showNotificationShareAction.isChecked())
+                .putBoolean(StackStore.KEEP_STACK_NOTIFICATION, keepStackNotification.isChecked())
                 .apply();
             updateStackBadge();
             dialog.dismiss();

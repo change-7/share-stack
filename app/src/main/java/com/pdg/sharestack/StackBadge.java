@@ -28,7 +28,12 @@ final class StackBadge {
         channel.setShowBadge(true);
         channel.setSound(null, null);
         manager.createNotificationChannel(channel);
-        Intent openApp = new Intent(context, MainActivity.class)
+        android.content.SharedPreferences preferences = context.getSharedPreferences(
+            StackStore.PREFS, Context.MODE_PRIVATE);
+        boolean shareWhenTapped = preferences.getBoolean(StackStore.SHOW_NOTIFICATION_SHARE_ACTION, false);
+        boolean keepStackNotification = preferences.getBoolean(StackStore.KEEP_STACK_NOTIFICATION, true);
+        Intent openApp = new Intent(context,
+            shareWhenTapped ? NotificationShareActivity.class : MainActivity.class)
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent pendingIntent = PendingIntent.getActivity(context, 0, openApp,
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
@@ -40,17 +45,10 @@ final class StackBadge {
             .setBadgeIconType(Notification.BADGE_ICON_SMALL)
             .setCategory(Notification.CATEGORY_STATUS)
             .setOnlyAlertOnce(true)
-            .setOngoing(true)
+            .setOngoing(keepStackNotification)
             .setContentIntent(pendingIntent);
-        boolean showShareAction = context.getSharedPreferences(StackStore.PREFS, Context.MODE_PRIVATE)
-            .getBoolean(StackStore.SHOW_NOTIFICATION_SHARE_ACTION, false);
-        if (showShareAction) {
-            Intent shareStack = new Intent(context, NotificationShareActivity.class);
-            PendingIntent sharePendingIntent = PendingIntent.getActivity(context, 1, shareStack,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-            builder.addAction(new Notification.Action.Builder(null, "전체 공유", sharePendingIntent).build());
-        }
         Notification notification = builder.build();
+        if (keepStackNotification) notification.flags |= Notification.FLAG_NO_CLEAR;
         manager.notify(NOTIFICATION_ID, notification);
     }
 }

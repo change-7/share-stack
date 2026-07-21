@@ -23,6 +23,10 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".NotificationShareActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.NoDisplay" />
         <provider
             android:name=".StackProvider"
             android:authorities="com.pdg.sharestack.items"

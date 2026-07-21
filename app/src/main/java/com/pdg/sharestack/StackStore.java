@@ -20,7 +20,9 @@ import java.util.UUID;
 final class StackStore {
     static final String PREFS = "stack";
     static final String ITEMS = "items";
+    static final String CLEAR_STACK_AFTER_SHARE = "clear_and_close_after_share";
     static final String OPEN_AFTER_RECEIVING = "open_after_receiving";
+    static final String SHOW_NOTIFICATION_SHARE_ACTION = "show_notification_share_action";
 
     private StackStore() { }
 

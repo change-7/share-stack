@@ -62,7 +62,6 @@ import java.util.zip.ZipOutputStream;
 
 public final class MainActivity extends Activity {
     private static final String PREFS = "stack";
-    private static final String CLEAR_STACK_AFTER_SHARE = "clear_and_close_after_share";
     private static final String VIEW_MODE = "view_mode";
     private static final String GRID_MODE = "grid";
     private static final String LIST_MODE = "list";
@@ -214,7 +213,7 @@ public final class MainActivity extends Activity {
         panel.addView(description);
         CheckBox clearAfterShare = new CheckBox(this);
         clearAfterShare.setText("공유 후 스택 비우기");
-        clearAfterShare.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(CLEAR_STACK_AFTER_SHARE, false));
+        clearAfterShare.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(StackStore.CLEAR_STACK_AFTER_SHARE, false));
         clearAfterShare.setTextSize(15);
         clearAfterShare.setTextColor(INK);
         clearAfterShare.setButtonTintList(new ColorStateList(new int[][] {new int[] {android.R.attr.state_checked}, new int[] {}}, new int[] {PRIMARY, 0xffa2adbd}));
@@ -238,6 +237,21 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams receiveOptionParams = new LinearLayout.LayoutParams(-1, -2);
         receiveOptionParams.setMargins(0, dp(8), 0, 0);
         panel.addView(receiveOption, receiveOptionParams);
+        CheckBox showNotificationShareAction = new CheckBox(this);
+        showNotificationShareAction.setText("알림에 전체 공유 버튼 표시");
+        showNotificationShareAction.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean(StackStore.SHOW_NOTIFICATION_SHARE_ACTION, false));
+        showNotificationShareAction.setTextSize(15);
+        showNotificationShareAction.setTextColor(INK);
+        showNotificationShareAction.setButtonTintList(new ColorStateList(new int[][] {new int[] {android.R.attr.state_checked}, new int[] {}}, new int[] {PRIMARY, 0xffa2adbd}));
+        LinearLayout notificationOption = new LinearLayout(this);
+        notificationOption.setGravity(Gravity.CENTER_VERTICAL);
+        notificationOption.setPadding(dp(10), dp(7), dp(8), dp(7));
+        notificationOption.setBackground(roundedBackground(0xfff0f5ff, 0, 16));
+        notificationOption.addView(showNotificationShareAction, new LinearLayout.LayoutParams(-1, dp(48)));
+        LinearLayout.LayoutParams notificationOptionParams = new LinearLayout.LayoutParams(-1, -2);
+        notificationOptionParams.setMargins(0, dp(8), 0, 0);
+        panel.addView(notificationOption, notificationOptionParams);
         LinearLayout buttons = new LinearLayout(this);
         buttons.setGravity(Gravity.CENTER_VERTICAL);
         buttons.setPadding(0, dp(20), 0, 0);
@@ -250,9 +264,11 @@ public final class MainActivity extends Activity {
         styleButton(save, PRIMARY, Color.WHITE, 0, 14, 14);
         save.setOnClickListener(v -> {
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putBoolean(CLEAR_STACK_AFTER_SHARE, clearAfterShare.isChecked())
+                .putBoolean(StackStore.CLEAR_STACK_AFTER_SHARE, clearAfterShare.isChecked())
                 .putBoolean(StackStore.OPEN_AFTER_RECEIVING, openAfterReceiving.isChecked())
+                .putBoolean(StackStore.SHOW_NOTIFICATION_SHARE_ACTION, showNotificationShareAction.isChecked())
                 .apply();
+            updateStackBadge();
             dialog.dismiss();
         });
         LinearLayout.LayoutParams cancelParams = new LinearLayout.LayoutParams(0, dp(48), 1);
@@ -797,7 +813,7 @@ public final class MainActivity extends Activity {
     }
 
     private void shareItems(List<StackItem> selected, boolean zipFiles) {
-        boolean clearAfterShare = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(CLEAR_STACK_AFTER_SHARE, false);
+        boolean clearAfterShare = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(StackStore.CLEAR_STACK_AFTER_SHARE, false);
         ArrayList<Uri> uris = new ArrayList<>();
         ArrayList<StackItem> sharedFiles = new ArrayList<>();
         String text = selectedText(selected);

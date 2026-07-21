@@ -32,7 +32,7 @@ final class StackBadge {
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent pendingIntent = PendingIntent.getActivity(context, 0, openApp,
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        Notification notification = new Notification.Builder(context, CHANNEL)
+        Notification.Builder builder = new Notification.Builder(context, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_stack)
             .setContentTitle("Share Stack")
             .setContentText("쌓인 항목 " + count + "개")
@@ -41,8 +41,16 @@ final class StackBadge {
             .setCategory(Notification.CATEGORY_STATUS)
             .setOnlyAlertOnce(true)
             .setOngoing(true)
-            .setContentIntent(pendingIntent)
-            .build();
+            .setContentIntent(pendingIntent);
+        boolean showShareAction = context.getSharedPreferences(StackStore.PREFS, Context.MODE_PRIVATE)
+            .getBoolean(StackStore.SHOW_NOTIFICATION_SHARE_ACTION, false);
+        if (showShareAction) {
+            Intent shareStack = new Intent(context, NotificationShareActivity.class);
+            PendingIntent sharePendingIntent = PendingIntent.getActivity(context, 1, shareStack,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            builder.addAction(new Notification.Action.Builder(null, "전체 공유", sharePendingIntent).build());
+        }
+        Notification notification = builder.build();
         manager.notify(NOTIFICATION_ID, notification);
     }
 }

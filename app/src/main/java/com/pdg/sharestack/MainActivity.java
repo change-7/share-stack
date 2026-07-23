@@ -66,6 +66,10 @@ public final class MainActivity extends Activity {
     private static final String GRID_MODE = "grid";
     private static final String LIST_MODE = "list";
     private static final int BADGE_PERMISSION_REQUEST = 1002;
+    private static final int CAPTURE_PHOTO_REQUEST = 1003;
+    private static final String CAPTURE_ID = "capture_id";
+    private static final String CAPTURE_NAME = "capture_name";
+    private static final String CAPTURE_TYPE = "capture_type";
     private static final int BACKGROUND = 0xfff6f8fc;
     private static final int SURFACE = Color.WHITE;
     private static final int INK = 0xff172033;
@@ -86,9 +90,17 @@ public final class MainActivity extends Activity {
     private Button deleteButton;
     private ImageButton viewButton;
     private boolean selectionsInitialized;
+    private String pendingCaptureId;
+    private String pendingCaptureName;
+    private String pendingCaptureType;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        if (state != null) {
+            pendingCaptureId = state.getString(CAPTURE_ID);
+            pendingCaptureName = state.getString(CAPTURE_NAME);
+            pendingCaptureType = state.getString(CAPTURE_TYPE);
+        }
         loadItems();
         buildUi();
         requestBadgePermissionIfNeeded();
@@ -132,6 +144,9 @@ public final class MainActivity extends Activity {
 
         LinearLayout toolbar = new LinearLayout(this);
         toolbar.setGravity(Gravity.CENTER_VERTICAL);
+        ImageButton camera = new ImageButton(this);
+        styleIconButton(camera, R.drawable.ic_camera, "카메라로 추가");
+        camera.setOnClickListener(v -> startCapture());
         View toolbarSpacer = new View(this);
         ImageButton settings = new ImageButton(this);
         styleIconButton(settings, R.drawable.ic_settings, "설정");
@@ -146,6 +161,7 @@ public final class MainActivity extends Activity {
         selectionSummary.setBackground(roundedBackground(0xffe9efff, 0, 50));
         LinearLayout.LayoutParams summaryParams = new LinearLayout.LayoutParams(-2, dp(32));
         summaryParams.setMargins(0, 0, dp(8), 0);
+        toolbar.addView(camera, new LinearLayout.LayoutParams(dp(48), dp(48)));
         toolbar.addView(toolbarSpacer, new LinearLayout.LayoutParams(0, dp(48), 1));
         toolbar.addView(selectionSummary, summaryParams);
         toolbar.addView(viewButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
@@ -190,6 +206,64 @@ public final class MainActivity extends Activity {
         root.addView(actions, actionsParams);
         setContentView(root);
         render();
+    }
+
+    @Override protected void onSaveInstanceState(Bundle state) {
+        super.onSaveInstanceState(state);
+        state.putString(CAPTURE_ID, pendingCaptureId);
+        state.putString(CAPTURE_NAME, pendingCaptureName);
+        state.putString(CAPTURE_TYPE, pendingCaptureType);
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != CAPTURE_PHOTO_REQUEST) return;
+        if (resultCode == RESULT_OK) {
+            if (data != null) {
+                pendingCaptureId = data.getStringExtra(CaptureActivity.EXTRA_CAPTURE_ID);
+                pendingCaptureName = data.getStringExtra(CaptureActivity.EXTRA_CAPTURE_NAME);
+                pendingCaptureType = data.getStringExtra(CaptureActivity.EXTRA_CAPTURE_TYPE);
+            }
+            addCapturedItem();
+        }
+        else discardPendingCapture();
+    }
+
+    private void startCapture() {
+        pendingCaptureId = UUID.randomUUID().toString() + ".jpg";
+        pendingCaptureName = "촬영 사진.jpg";
+        pendingCaptureType = "image/jpeg";
+        new File(getFilesDir(), "capture").mkdirs();
+        Intent capture = new Intent(this, CaptureActivity.class)
+            .putExtra(CaptureActivity.EXTRA_CAPTURE_ID, pendingCaptureId)
+            .putExtra(CaptureActivity.EXTRA_CAPTURE_NAME, pendingCaptureName)
+            .putExtra(CaptureActivity.EXTRA_CAPTURE_TYPE, pendingCaptureType);
+        startActivityForResult(capture, CAPTURE_PHOTO_REQUEST);
+    }
+
+    private void addCapturedItem() {
+        if (pendingCaptureId == null || pendingCaptureName == null || pendingCaptureType == null) return;
+        File capturedFile = new File(getFilesDir(), "capture/" + pendingCaptureId);
+        if (capturedFile.length() == 0) {
+            discardPendingCapture();
+            toast("촬영 파일을 저장할 수 없습니다");
+            return;
+        }
+        Intent capturedIntent = new Intent(Intent.ACTION_SEND)
+            .setType(pendingCaptureType)
+            .putExtra(Intent.EXTRA_STREAM, contentUri("capture/", pendingCaptureId, pendingCaptureName, pendingCaptureType));
+        int before = items.size();
+        StackStore.receive(this, capturedIntent);
+        discardPendingCapture();
+        reloadItems();
+        toast(items.size() > before ? "카메라 항목을 스택에 추가했습니다" : "이미 스택에 있는 항목입니다");
+    }
+
+    private void discardPendingCapture() {
+        if (pendingCaptureId != null) new File(getFilesDir(), "capture/" + pendingCaptureId).delete();
+        pendingCaptureId = null;
+        pendingCaptureName = null;
+        pendingCaptureType = null;
     }
 
     private void showSettings() {

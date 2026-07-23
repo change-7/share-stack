@@ -21,9 +21,9 @@ public final class StackProvider extends ContentProvider {
     }
 
     @Override public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
-        if (!"r".equals(mode)) throw new FileNotFoundException("Read-only provider");
         File file = fileFor(uri);
-        return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY);
+        if ("r".equals(mode)) return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY);
+        throw new FileNotFoundException("Read-only provider");
     }
 
     @Override public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
@@ -39,8 +39,13 @@ public final class StackProvider extends ContentProvider {
 
     private File fileFor(Uri uri) {
         boolean sharedFile = uri.getPathSegments().size() == 2 && "shared".equals(uri.getPathSegments().get(0));
+        boolean captureFile = isCaptureUri(uri);
         Context context = getContext();
         if (context == null) throw new IllegalStateException("Provider context is unavailable");
-        return new File(context.getFilesDir(), (sharedFile ? "shared/" : "items/") + uri.getLastPathSegment());
+        return new File(context.getFilesDir(), (captureFile ? "capture/" : sharedFile ? "shared/" : "items/") + uri.getLastPathSegment());
+    }
+
+    private boolean isCaptureUri(Uri uri) {
+        return uri.getPathSegments().size() == 2 && "capture".equals(uri.getPathSegments().get(0));
     }
 }

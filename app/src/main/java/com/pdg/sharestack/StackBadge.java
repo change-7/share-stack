@@ -10,7 +10,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 
 final class StackBadge {
-    private static final String CHANNEL = "stack_count";
+    private static final String CHANNEL = "stack_count_v2";
     private static final int NOTIFICATION_ID = 1001;
 
     private StackBadge() { }
@@ -24,7 +24,7 @@ final class StackBadge {
         }
         if (android.os.Build.VERSION.SDK_INT >= 33
             && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return;
-        NotificationChannel channel = new NotificationChannel(CHANNEL, "스택 개수", NotificationManager.IMPORTANCE_MIN);
+        NotificationChannel channel = new NotificationChannel(CHANNEL, "스택 개수", NotificationManager.IMPORTANCE_LOW);
         channel.setShowBadge(true);
         channel.setSound(null, null);
         manager.createNotificationChannel(channel);

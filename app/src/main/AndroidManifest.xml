@@ -32,6 +32,36 @@
         <activity
             android:name=".CaptureActivity"
             android:exported="false" />
+        <service
+            android:name=".QuickCameraTileService"
+            android:icon="@drawable/ic_camera"
+            android:label="카메라로 추가"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+        <service
+            android:name=".QuickClipboardTileService"
+            android:icon="@drawable/ic_stat_stack"
+            android:label="클립보드 텍스트 추가"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+        <service
+            android:name=".QuickShareTileService"
+            android:icon="@drawable/ic_stat_stack"
+            android:label="전체 공유"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
         <receiver
             android:name=".ShareSelectionReceiver"
             android:exported="false" />

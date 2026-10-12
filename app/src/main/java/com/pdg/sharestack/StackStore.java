@@ -24,6 +24,8 @@ final class StackStore {
     static final String OPEN_AFTER_RECEIVING = "open_after_receiving";
     static final String SHOW_NOTIFICATION_SHARE_ACTION = "show_notification_share_action";
     static final String KEEP_STACK_NOTIFICATION = "keep_stack_notification";
+    static final String AUTO_EXPIRY_DAYS = "auto_expiry_days";
+    static final String SAVE_URL_WITH_MEDIA = "save_url_with_media";
 
     private StackStore() { }
 
@@ -31,12 +33,33 @@ final class StackStore {
         File directory = itemDirectory(context);
         ArrayList<StackItem> result = new ArrayList<>();
         String saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(ITEMS, "");
+        boolean changed = false;
+        int expiryDays = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getInt(AUTO_EXPIRY_DAYS, 0);
+        long cutoff = expiryDays <= 0 ? Long.MIN_VALUE
+            : System.currentTimeMillis() - expiryDays * 24L * 60L * 60L * 1000L;
         if (!saved.isEmpty()) {
             for (String row : saved.split("\\n")) {
                 StackItem item = StackItem.deserialize(row);
-                if (item != null && new File(directory, item.id).isFile()) result.add(item);
+                if (item == null) {
+                    changed = true;
+                    continue;
+                }
+                File file = new File(directory, item.id);
+                if (!file.isFile()) {
+                    changed = true;
+                    continue;
+                }
+                long createdAt = item.createdAt > 0 ? item.createdAt : file.lastModified();
+                if (createdAt < cutoff) {
+                    file.delete();
+                    changed = true;
+                    continue;
+                }
+                result.add(item);
             }
         }
+        if (changed) save(context, result);
         return result;
     }
 
@@ -52,27 +75,24 @@ final class StackStore {
     static int remove(Context context, ArrayList<String> itemIds) {
         ArrayList<StackItem> remaining = new ArrayList<>();
         for (StackItem item : load(context)) {
-            if (itemIds.contains(item.id)) itemFile(context, item.id).delete();
+            if (itemIds.contains(item.id) && !item.locked) itemFile(context, item.id).delete();
             else remaining.add(item);
         }
         save(context, remaining);
         return remaining.size();
     }
 
+    static int removeUnlocked(Context context) {
+        ArrayList<StackItem> items = load(context);
+        ArrayList<String> itemIds = new ArrayList<>();
+        for (StackItem item : items) if (!item.locked) itemIds.add(item.id);
+        return remove(context, itemIds);
+    }
+
     @SuppressWarnings("deprecation")
     static int receive(Context context, Intent intent) {
         ArrayList<StackItem> items = load(context);
         boolean added = false;
-        String text = intent.getStringExtra(Intent.EXTRA_TEXT);
-        if (text != null && !text.isEmpty()) {
-            String id = UUID.randomUUID().toString() + ".txt";
-            File destination = itemFile(context, id);
-            if (writeBytes(destination, text.getBytes(StandardCharsets.UTF_8))
-                && addUniqueItem(context, items, destination, "text/plain", shorten(text))) {
-                added = true;
-            }
-        }
-
         ArrayList<Uri> uris = new ArrayList<>();
         if (Intent.ACTION_SEND_MULTIPLE.equals(intent.getAction())) {
             ArrayList<Uri> multiple = android.os.Build.VERSION.SDK_INT >= 33
@@ -89,6 +109,18 @@ final class StackStore {
             for (int i = 0; i < intent.getClipData().getItemCount(); i++) {
                 Uri uri = intent.getClipData().getItemAt(i).getUri();
                 if (uri != null && !uris.contains(uri)) uris.add(uri);
+            }
+        }
+        String text = intent.getStringExtra(Intent.EXTRA_TEXT);
+        boolean saveUrlWithMedia = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(SAVE_URL_WITH_MEDIA, true);
+        if (text != null && !text.isEmpty()
+            && (uris.isEmpty() || saveUrlWithMedia || !isWebUrl(text))) {
+            String id = UUID.randomUUID().toString() + ".txt";
+            File destination = itemFile(context, id);
+            if (writeBytes(destination, text.getBytes(StandardCharsets.UTF_8))
+                && addUniqueItem(context, items, destination, "text/plain", shorten(text))) {
+                added = true;
             }
         }
         for (Uri uri : uris) if (copyUri(context, uri, intent.getType(), items)) added = true;
@@ -191,5 +223,11 @@ final class StackStore {
 
     private static String shorten(String text) {
         return text.length() > 80 ? text.substring(0, 77) + "…" : text;
+    }
+
+    private static boolean isWebUrl(String text) {
+        Uri uri = Uri.parse(text.trim());
+        String scheme = uri.getScheme();
+        return uri.getHost() != null && ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme));
     }
 }

@@ -8,6 +8,7 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.res.ColorStateList;
@@ -33,7 +34,9 @@ import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
 import android.provider.MediaStore;
+import android.provider.DocumentsContract;
 import android.text.TextUtils;
+import android.view.DragEvent;
 import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
@@ -52,11 +55,16 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
+import java.text.SimpleDateFormat;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -66,10 +74,13 @@ public final class MainActivity extends Activity {
     private static final String GRID_MODE = "grid";
     private static final String LIST_MODE = "list";
     private static final int BADGE_PERMISSION_REQUEST = 1002;
-    private static final int CAPTURE_PHOTO_REQUEST = 1003;
-    private static final String CAPTURE_ID = "capture_id";
-    private static final String CAPTURE_NAME = "capture_name";
-    private static final String CAPTURE_TYPE = "capture_type";
+    private static final int ARCHIVE_FOLDER_REQUEST = 1004;
+    private static final String ARCHIVE_FOLDER_URI = "archive_folder_uri";
+    private static final String ARCHIVE_FOLDER_NAME = "archive_folder_name";
+    private static final String SORT_MODE = "sort_mode";
+    private static final int SORT_MANUAL = 0;
+    private static final int SORT_NEWEST = 1;
+    private static final int SORT_OLDEST = 2;
     private static final int BACKGROUND = 0xfff6f8fc;
     private static final int SURFACE = Color.WHITE;
     private static final int INK = 0xff172033;
@@ -87,20 +98,16 @@ public final class MainActivity extends Activity {
     private TextView selectionSummary;
     private Button shareButton;
     private Button copyButton;
+    private Button archiveButton;
     private Button deleteButton;
-    private ImageButton viewButton;
+    private Button selectionToggleButton;
+    private Button archiveFolderSettingButton;
+    private ArrayList<String> pendingArchiveItemIds;
+    private boolean archivingItems;
     private boolean selectionsInitialized;
-    private String pendingCaptureId;
-    private String pendingCaptureName;
-    private String pendingCaptureType;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        if (state != null) {
-            pendingCaptureId = state.getString(CAPTURE_ID);
-            pendingCaptureName = state.getString(CAPTURE_NAME);
-            pendingCaptureType = state.getString(CAPTURE_TYPE);
-        }
         loadItems();
         buildUi();
         requestBadgePermissionIfNeeded();
@@ -119,12 +126,19 @@ public final class MainActivity extends Activity {
     }
 
     private void reloadItems() {
+        ArrayList<String> existingItemIds = new ArrayList<>();
+        for (StackItem item : items) existingItemIds.add(item.id);
         selectedItemIds.clear();
         for (CheckBox selection : selections) {
             if (selection.isChecked()) selectedItemIds.add((String) selection.getTag());
         }
         items.clear();
         loadItems();
+        for (StackItem item : items) {
+            if (!existingItemIds.contains(item.id) && !selectedItemIds.contains(item.id)) {
+                selectedItemIds.add(item.id);
+            }
+        }
         render();
     }
 
@@ -151,20 +165,22 @@ public final class MainActivity extends Activity {
         ImageButton settings = new ImageButton(this);
         styleIconButton(settings, R.drawable.ic_settings, "설정");
         settings.setOnClickListener(v -> showSettings());
-        viewButton = new ImageButton(this);
-        styleIconButton(viewButton, R.drawable.ic_view_list, "목록 보기로 전환");
-        viewButton.setOnClickListener(v -> toggleViewMode());
         selectionSummary = new TextView(this);
         selectionSummary.setTextSize(13);
         selectionSummary.setGravity(Gravity.CENTER);
         selectionSummary.setPadding(dp(10), 0, dp(10), 0);
         selectionSummary.setBackground(roundedBackground(0xffe9efff, 0, 50));
         LinearLayout.LayoutParams summaryParams = new LinearLayout.LayoutParams(-2, dp(32));
-        summaryParams.setMargins(0, 0, dp(8), 0);
+        summaryParams.setMargins(0, 0, dp(6), 0);
+        selectionToggleButton = new Button(this);
+        styleActionButton(selectionToggleButton, 0xffeef3ff, PRIMARY_DARK, 0, 14, 12);
+        selectionToggleButton.setOnClickListener(v -> toggleAllItems());
+        LinearLayout.LayoutParams selectionToggleParams = new LinearLayout.LayoutParams(dp(112), dp(40));
+        selectionToggleParams.setMargins(0, 0, dp(6), 0);
         toolbar.addView(camera, new LinearLayout.LayoutParams(dp(48), dp(48)));
         toolbar.addView(toolbarSpacer, new LinearLayout.LayoutParams(0, dp(48), 1));
         toolbar.addView(selectionSummary, summaryParams);
-        toolbar.addView(viewButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        toolbar.addView(selectionToggleButton, selectionToggleParams);
         toolbar.addView(settings, new LinearLayout.LayoutParams(dp(48), dp(48)));
         LinearLayout.LayoutParams toolbarParams = new LinearLayout.LayoutParams(-1, dp(48));
         toolbarParams.setMargins(0, 0, 0, dp(12));
@@ -189,81 +205,37 @@ public final class MainActivity extends Activity {
         copyButton = new Button(this);
         copyButton.setText("텍스트 복사");
         styleActionButton(copyButton, 0xffeef3ff, PRIMARY_DARK, 0, 14, 12);
-        copyButton.setOnClickListener(v -> copySelectedText());
+        copyButton.setOnClickListener(v -> copySelectedContent());
+        archiveButton = new Button(this);
+        archiveButton.setText("보관");
+        styleActionButton(archiveButton, 0xffeef3ff, PRIMARY_DARK, 0, 14, 12);
+        archiveButton.setContentDescription("선택 항목을 보관 폴더에 저장");
+        archiveButton.setOnClickListener(v -> saveSelectedToFolder());
         deleteButton = new Button(this);
         deleteButton.setText("선택 삭제");
         styleActionButton(deleteButton, 0xfffff0f2, DANGER, 0, 14, 12);
         deleteButton.setOnClickListener(v -> clearSelected());
         LinearLayout.LayoutParams shareParams = new LinearLayout.LayoutParams(0, dp(48), 1);
-        shareParams.setMargins(0, 0, dp(3), 0);
+        shareParams.setMargins(0, 0, dp(2), 0);
         LinearLayout.LayoutParams copyParams = new LinearLayout.LayoutParams(0, dp(48), 1);
-        copyParams.setMargins(dp(3), 0, dp(3), 0);
+        copyParams.setMargins(dp(2), 0, dp(2), 0);
+        LinearLayout.LayoutParams archiveParams = new LinearLayout.LayoutParams(0, dp(48), 1);
+        archiveParams.setMargins(dp(2), 0, dp(2), 0);
         LinearLayout.LayoutParams clearParams = new LinearLayout.LayoutParams(0, dp(48), 1);
-        clearParams.setMargins(dp(3), 0, 0, 0);
+        clearParams.setMargins(dp(2), 0, 0, 0);
         actions.addView(shareButton, shareParams);
         actions.addView(copyButton, copyParams);
+        actions.addView(archiveButton, archiveParams);
         actions.addView(deleteButton, clearParams);
         root.addView(actions, actionsParams);
         setContentView(root);
         render();
     }
 
-    @Override protected void onSaveInstanceState(Bundle state) {
-        super.onSaveInstanceState(state);
-        state.putString(CAPTURE_ID, pendingCaptureId);
-        state.putString(CAPTURE_NAME, pendingCaptureName);
-        state.putString(CAPTURE_TYPE, pendingCaptureType);
-    }
-
-    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != CAPTURE_PHOTO_REQUEST) return;
-        if (resultCode == RESULT_OK) {
-            if (data != null) {
-                pendingCaptureId = data.getStringExtra(CaptureActivity.EXTRA_CAPTURE_ID);
-                pendingCaptureName = data.getStringExtra(CaptureActivity.EXTRA_CAPTURE_NAME);
-                pendingCaptureType = data.getStringExtra(CaptureActivity.EXTRA_CAPTURE_TYPE);
-            }
-            addCapturedItem();
-        }
-        else discardPendingCapture();
-    }
-
     private void startCapture() {
-        pendingCaptureId = UUID.randomUUID().toString() + ".jpg";
-        pendingCaptureName = "촬영 사진.jpg";
-        pendingCaptureType = "image/jpeg";
-        new File(getFilesDir(), "capture").mkdirs();
         Intent capture = new Intent(this, CaptureActivity.class)
-            .putExtra(CaptureActivity.EXTRA_CAPTURE_ID, pendingCaptureId)
-            .putExtra(CaptureActivity.EXTRA_CAPTURE_NAME, pendingCaptureName)
-            .putExtra(CaptureActivity.EXTRA_CAPTURE_TYPE, pendingCaptureType);
-        startActivityForResult(capture, CAPTURE_PHOTO_REQUEST);
-    }
-
-    private void addCapturedItem() {
-        if (pendingCaptureId == null || pendingCaptureName == null || pendingCaptureType == null) return;
-        File capturedFile = new File(getFilesDir(), "capture/" + pendingCaptureId);
-        if (capturedFile.length() == 0) {
-            discardPendingCapture();
-            toast("촬영 파일을 저장할 수 없습니다");
-            return;
-        }
-        Intent capturedIntent = new Intent(Intent.ACTION_SEND)
-            .setType(pendingCaptureType)
-            .putExtra(Intent.EXTRA_STREAM, contentUri("capture/", pendingCaptureId, pendingCaptureName, pendingCaptureType));
-        int before = items.size();
-        StackStore.receive(this, capturedIntent);
-        discardPendingCapture();
-        reloadItems();
-        toast(items.size() > before ? "카메라 항목을 스택에 추가했습니다" : "이미 스택에 있는 항목입니다");
-    }
-
-    private void discardPendingCapture() {
-        if (pendingCaptureId != null) new File(getFilesDir(), "capture/" + pendingCaptureId).delete();
-        pendingCaptureId = null;
-        pendingCaptureName = null;
-        pendingCaptureType = null;
+            .putExtra(CaptureActivity.EXTRA_CAPTURE_ID, java.util.UUID.randomUUID() + ".jpg");
+        startActivity(capture);
     }
 
     private void showSettings() {
@@ -271,99 +243,188 @@ public final class MainActivity extends Activity {
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(24), dp(24), dp(24), dp(18));
-        panel.setBackground(roundedBackground(SURFACE, BORDER, 24));
+        panel.setPadding(dp(18), dp(18), dp(18), dp(12));
+        panel.setBackground(roundedBackground(SURFACE, BORDER, 20));
         TextView title = new TextView(this);
         title.setText("설정");
-        title.setTextSize(22);
+        title.setTextSize(20);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setTextColor(INK);
         panel.addView(title);
-        TextView description = new TextView(this);
-        description.setText("공유와 알림 동작을 선택하세요.");
-        description.setTextSize(14);
-        description.setTextColor(MUTED);
-        description.setPadding(0, dp(6), 0, dp(18));
-        panel.addView(description);
+        addSettingsSection(panel, "공유 및 알림");
+        int[] expiryDays = {getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getInt(StackStore.AUTO_EXPIRY_DAYS, 0)};
+        int[] sortMode = {getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getInt(SORT_MODE, SORT_MANUAL)};
+        String[] viewMode = {getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getString(VIEW_MODE, GRID_MODE)};
         CheckBox clearAfterShare = new CheckBox(this);
         clearAfterShare.setText("공유 후 스택 비우기");
         clearAfterShare.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(StackStore.CLEAR_STACK_AFTER_SHARE, false));
-        clearAfterShare.setTextSize(15);
+        clearAfterShare.setTextSize(14);
         clearAfterShare.setTextColor(INK);
         clearAfterShare.setButtonTintList(new ColorStateList(new int[][] {new int[] {android.R.attr.state_checked}, new int[] {}}, new int[] {PRIMARY, 0xffa2adbd}));
         LinearLayout option = new LinearLayout(this);
         option.setGravity(Gravity.CENTER_VERTICAL);
-        option.setPadding(dp(10), dp(7), dp(8), dp(7));
-        option.setBackground(roundedBackground(0xfff0f5ff, 0, 16));
-        option.addView(clearAfterShare, new LinearLayout.LayoutParams(-1, dp(48)));
-        panel.addView(option);
+        option.setPadding(dp(2), 0, 0, 0);
+        option.addView(clearAfterShare, new LinearLayout.LayoutParams(-1, dp(44)));
+        panel.addView(option, new LinearLayout.LayoutParams(-1, dp(44)));
+        addSettingsDivider(panel);
+        CheckBox saveUrlWithMedia = new CheckBox(this);
+        saveUrlWithMedia.setText("이미지 공유 시 URL도 저장");
+        saveUrlWithMedia.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean(StackStore.SAVE_URL_WITH_MEDIA, true));
+        saveUrlWithMedia.setTextSize(14);
+        saveUrlWithMedia.setTextColor(INK);
+        saveUrlWithMedia.setButtonTintList(new ColorStateList(new int[][] {new int[] {android.R.attr.state_checked}, new int[] {}}, new int[] {PRIMARY, 0xffa2adbd}));
+        LinearLayout urlOption = new LinearLayout(this);
+        urlOption.setGravity(Gravity.CENTER_VERTICAL);
+        urlOption.setPadding(dp(2), 0, 0, 0);
+        urlOption.addView(saveUrlWithMedia, new LinearLayout.LayoutParams(-1, dp(44)));
+        panel.addView(urlOption, new LinearLayout.LayoutParams(-1, dp(44)));
+        addSettingsDivider(panel);
         CheckBox openAfterReceiving = new CheckBox(this);
         openAfterReceiving.setText("공유받은 뒤 앱 열기");
         openAfterReceiving.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(StackStore.OPEN_AFTER_RECEIVING, false));
-        openAfterReceiving.setTextSize(15);
+        openAfterReceiving.setTextSize(14);
         openAfterReceiving.setTextColor(INK);
         openAfterReceiving.setButtonTintList(new ColorStateList(new int[][] {new int[] {android.R.attr.state_checked}, new int[] {}}, new int[] {PRIMARY, 0xffa2adbd}));
         LinearLayout receiveOption = new LinearLayout(this);
         receiveOption.setGravity(Gravity.CENTER_VERTICAL);
-        receiveOption.setPadding(dp(10), dp(7), dp(8), dp(7));
-        receiveOption.setBackground(roundedBackground(0xfff0f5ff, 0, 16));
-        receiveOption.addView(openAfterReceiving, new LinearLayout.LayoutParams(-1, dp(48)));
-        LinearLayout.LayoutParams receiveOptionParams = new LinearLayout.LayoutParams(-1, -2);
-        receiveOptionParams.setMargins(0, dp(8), 0, 0);
+        receiveOption.setPadding(dp(2), 0, 0, 0);
+        receiveOption.addView(openAfterReceiving, new LinearLayout.LayoutParams(-1, dp(44)));
+        LinearLayout.LayoutParams receiveOptionParams = new LinearLayout.LayoutParams(-1, dp(44));
+        receiveOptionParams.setMargins(0, 0, 0, 0);
         panel.addView(receiveOption, receiveOptionParams);
+        addSettingsDivider(panel);
         CheckBox showNotificationShareAction = new CheckBox(this);
         showNotificationShareAction.setText("알림을 누르면 전체 공유");
         showNotificationShareAction.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE)
             .getBoolean(StackStore.SHOW_NOTIFICATION_SHARE_ACTION, false));
-        showNotificationShareAction.setTextSize(15);
+        showNotificationShareAction.setTextSize(14);
         showNotificationShareAction.setTextColor(INK);
         showNotificationShareAction.setButtonTintList(new ColorStateList(new int[][] {new int[] {android.R.attr.state_checked}, new int[] {}}, new int[] {PRIMARY, 0xffa2adbd}));
         LinearLayout notificationOption = new LinearLayout(this);
         notificationOption.setGravity(Gravity.CENTER_VERTICAL);
-        notificationOption.setPadding(dp(10), dp(7), dp(8), dp(7));
-        notificationOption.setBackground(roundedBackground(0xfff0f5ff, 0, 16));
-        notificationOption.addView(showNotificationShareAction, new LinearLayout.LayoutParams(-1, dp(48)));
-        LinearLayout.LayoutParams notificationOptionParams = new LinearLayout.LayoutParams(-1, -2);
-        notificationOptionParams.setMargins(0, dp(8), 0, 0);
+        notificationOption.setPadding(dp(2), 0, 0, 0);
+        notificationOption.addView(showNotificationShareAction, new LinearLayout.LayoutParams(-1, dp(44)));
+        LinearLayout.LayoutParams notificationOptionParams = new LinearLayout.LayoutParams(-1, dp(44));
+        notificationOptionParams.setMargins(0, 0, 0, 0);
         panel.addView(notificationOption, notificationOptionParams);
+        addSettingsDivider(panel);
         CheckBox keepStackNotification = new CheckBox(this);
         keepStackNotification.setText("스택 알림 고정");
         keepStackNotification.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE)
             .getBoolean(StackStore.KEEP_STACK_NOTIFICATION, true));
-        keepStackNotification.setTextSize(15);
+        keepStackNotification.setTextSize(14);
         keepStackNotification.setTextColor(INK);
         keepStackNotification.setButtonTintList(new ColorStateList(new int[][] {new int[] {android.R.attr.state_checked}, new int[] {}}, new int[] {PRIMARY, 0xffa2adbd}));
         LinearLayout keepNotificationOption = new LinearLayout(this);
         keepNotificationOption.setGravity(Gravity.CENTER_VERTICAL);
-        keepNotificationOption.setPadding(dp(10), dp(7), dp(8), dp(7));
-        keepNotificationOption.setBackground(roundedBackground(0xfff0f5ff, 0, 16));
-        keepNotificationOption.addView(keepStackNotification, new LinearLayout.LayoutParams(-1, dp(48)));
-        LinearLayout.LayoutParams keepNotificationOptionParams = new LinearLayout.LayoutParams(-1, -2);
-        keepNotificationOptionParams.setMargins(0, dp(8), 0, 0);
+        keepNotificationOption.setPadding(dp(2), 0, 0, 0);
+        keepNotificationOption.addView(keepStackNotification, new LinearLayout.LayoutParams(-1, dp(44)));
+        LinearLayout.LayoutParams keepNotificationOptionParams = new LinearLayout.LayoutParams(-1, dp(44));
+        keepNotificationOptionParams.setMargins(0, 0, 0, 0);
         panel.addView(keepNotificationOption, keepNotificationOptionParams);
+        addSettingsSection(panel, "보기 및 정리");
+        Button sorting = new Button(this);
+        stylePlainSettingsButton(sorting);
+        updateSortingButton(sorting, sortMode[0]);
+        sorting.setOnClickListener(view -> {
+            String[] choices = {"수동 순서", "최신순", "오래된순"};
+            new AlertDialog.Builder(this)
+                .setTitle("스택 정렬")
+                .setSingleChoiceItems(choices, sortMode[0], (picker, which) -> {
+                    sortMode[0] = which;
+                    updateSortingButton(sorting, sortMode[0]);
+                    picker.dismiss();
+                })
+                .show();
+        });
+        LinearLayout.LayoutParams sortingParams = new LinearLayout.LayoutParams(-1, dp(44));
+        sortingParams.setMargins(0, 0, 0, 0);
+        panel.addView(sorting, sortingParams);
+        addSettingsDivider(panel);
+        Button viewModeButton = new Button(this);
+        stylePlainSettingsButton(viewModeButton);
+        updateViewModeButton(viewModeButton, viewMode[0]);
+        viewModeButton.setOnClickListener(view -> {
+            String[] choices = {"썸네일형", "목록형"};
+            int checked = LIST_MODE.equals(viewMode[0]) ? 1 : 0;
+            new AlertDialog.Builder(this)
+                .setTitle("보기 방식")
+                .setSingleChoiceItems(choices, checked, (picker, which) -> {
+                    viewMode[0] = which == 1 ? LIST_MODE : GRID_MODE;
+                    updateViewModeButton(viewModeButton, viewMode[0]);
+                    getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .putString(VIEW_MODE, viewMode[0])
+                        .apply();
+                    render();
+                    picker.dismiss();
+                })
+                .show();
+        });
+        LinearLayout.LayoutParams viewModeParams = new LinearLayout.LayoutParams(-1, dp(44));
+        viewModeParams.setMargins(0, 0, 0, 0);
+        panel.addView(viewModeButton, viewModeParams);
+        addSettingsDivider(panel);
+        Button expiry = new Button(this);
+        stylePlainSettingsButton(expiry);
+        updateExpiryButton(expiry, expiryDays[0]);
+        expiry.setOnClickListener(view -> {
+            String[] choices = {"사용 안 함", "1일 뒤", "7일 뒤", "30일 뒤"};
+            int[] values = {0, 1, 7, 30};
+            int checked = 0;
+            for (int index = 0; index < values.length; index++) {
+                if (values[index] == expiryDays[0]) checked = index;
+            }
+            new AlertDialog.Builder(this)
+                .setTitle("스택 자동 만료")
+                .setSingleChoiceItems(choices, checked, (picker, which) -> {
+                    expiryDays[0] = values[which];
+                    updateExpiryButton(expiry, expiryDays[0]);
+                    picker.dismiss();
+                })
+                .show();
+        });
+        LinearLayout.LayoutParams expiryParams = new LinearLayout.LayoutParams(-1, dp(44));
+        expiryParams.setMargins(0, 0, 0, 0);
+        panel.addView(expiry, expiryParams);
+        addSettingsDivider(panel);
+        archiveFolderSettingButton = new Button(this);
+        stylePlainSettingsButton(archiveFolderSettingButton);
+        updateArchiveFolderButton(archiveFolderSettingButton);
+        archiveFolderSettingButton.setOnClickListener(view -> chooseArchiveFolder(null));
+        panel.addView(archiveFolderSettingButton,
+            new LinearLayout.LayoutParams(-1, dp(44)));
         LinearLayout buttons = new LinearLayout(this);
         buttons.setGravity(Gravity.CENTER_VERTICAL);
-        buttons.setPadding(0, dp(20), 0, 0);
+        buttons.setPadding(0, dp(14), 0, 0);
         Button cancel = new Button(this);
         cancel.setText("취소");
-        styleButton(cancel, 0xffeef3ff, PRIMARY_DARK, 0, 14, 14);
+        styleCompactSettingsButton(cancel, 0xfff7f9fc, PRIMARY_DARK, BORDER, 12, 14);
         cancel.setOnClickListener(v -> dialog.dismiss());
         Button save = new Button(this);
         save.setText("저장");
-        styleButton(save, PRIMARY, Color.WHITE, 0, 14, 14);
+        styleCompactSettingsButton(save, PRIMARY, Color.WHITE, 0, 12, 14);
         save.setOnClickListener(v -> {
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putBoolean(StackStore.CLEAR_STACK_AFTER_SHARE, clearAfterShare.isChecked())
+                .putBoolean(StackStore.SAVE_URL_WITH_MEDIA, saveUrlWithMedia.isChecked())
                 .putBoolean(StackStore.OPEN_AFTER_RECEIVING, openAfterReceiving.isChecked())
                 .putBoolean(StackStore.SHOW_NOTIFICATION_SHARE_ACTION, showNotificationShareAction.isChecked())
                 .putBoolean(StackStore.KEEP_STACK_NOTIFICATION, keepStackNotification.isChecked())
+                .putInt(StackStore.AUTO_EXPIRY_DAYS, expiryDays[0])
+                .putInt(SORT_MODE, sortMode[0])
+                .putString(VIEW_MODE, viewMode[0])
                 .apply();
+            reloadItems();
             updateStackBadge();
             dialog.dismiss();
         });
-        LinearLayout.LayoutParams cancelParams = new LinearLayout.LayoutParams(0, dp(48), 1);
+        LinearLayout.LayoutParams cancelParams = new LinearLayout.LayoutParams(0, dp(44), 1);
         cancelParams.setMargins(0, 0, dp(4), 0);
-        LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(0, dp(48), 1);
+        LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(0, dp(44), 1);
         saveParams.setMargins(dp(4), 0, 0, 0);
         buttons.addView(cancel, cancelParams);
         buttons.addView(save, saveParams);
@@ -376,11 +437,160 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void toggleViewMode() {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putString(VIEW_MODE, isListMode() ? GRID_MODE : LIST_MODE)
-            .apply();
-        render();
+    private void updateExpiryButton(Button button, int days) {
+        button.setText(days <= 0 ? "자동 만료 · 사용 안 함" : "자동 만료 · " + days + "일 뒤");
+    }
+
+    private void updateSortingButton(Button button, int mode) {
+        button.setText(mode == SORT_NEWEST ? "정렬 · 최신순"
+            : mode == SORT_OLDEST ? "정렬 · 오래된순" : "정렬 · 수동 순서");
+    }
+
+    private void updateViewModeButton(Button button, String mode) {
+        button.setText(LIST_MODE.equals(mode) ? "보기 방식 · 목록형" : "보기 방식 · 썸네일형");
+    }
+
+    private void updateArchiveFolderButton(Button button) {
+        String folderName = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getString(ARCHIVE_FOLDER_NAME, null);
+        button.setText(folderName == null || folderName.isEmpty()
+            ? "보관 폴더 지정" : "보관 폴더 · " + folderName);
+        button.setSingleLine(true);
+        button.setEllipsize(TextUtils.TruncateAt.END);
+    }
+
+    private void saveSelectedToFolder() {
+        List<StackItem> chosen = selected();
+        if (chosen.isEmpty()) {
+            toast("보관할 항목을 선택하세요");
+            return;
+        }
+        String savedUri = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getString(ARCHIVE_FOLDER_URI, null);
+        if (savedUri == null || savedUri.isEmpty()) {
+            ArrayList<String> itemIds = new ArrayList<>();
+            for (StackItem item : chosen) itemIds.add(item.id);
+            chooseArchiveFolder(itemIds);
+            return;
+        }
+        archiveItems(chosen, Uri.parse(savedUri));
+    }
+
+    private void chooseArchiveFolder(ArrayList<String> itemIds) {
+        pendingArchiveItemIds = itemIds == null ? null : new ArrayList<>(itemIds);
+        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        try {
+            startActivityForResult(picker, ARCHIVE_FOLDER_REQUEST);
+        } catch (ActivityNotFoundException | SecurityException exception) {
+            pendingArchiveItemIds = null;
+            toast("폴더 선택 화면을 열 수 없습니다");
+        }
+    }
+
+    private String archiveFolderName(Uri treeUri) {
+        String documentId = DocumentsContract.getTreeDocumentId(treeUri);
+        if (documentId == null || documentId.isEmpty()) return "선택됨";
+        int separator = Math.max(documentId.lastIndexOf('/'), documentId.lastIndexOf(':'));
+        String name = documentId.substring(separator + 1).trim();
+        return name.isEmpty() ? "선택됨" : name;
+    }
+
+    private void archiveItems(List<StackItem> selectedItems, Uri treeUri) {
+        if (archivingItems || selectedItems.isEmpty()) return;
+        archivingItems = true;
+        updateSelectionState();
+        toast("선택한 항목을 폴더에 보관합니다");
+        ArrayList<StackItem> snapshot = new ArrayList<>(selectedItems);
+        new Thread(() -> {
+            Set<String> existingNames = existingArchiveNames(treeUri);
+            int saved = 0;
+            int failed = 0;
+            for (StackItem item : snapshot) {
+                Uri createdDocument = null;
+                try {
+                    String fileName = uniqueArchiveName(archiveFileName(item), existingNames);
+                    String mimeType = item.mimeType == null || item.mimeType.isEmpty()
+                        ? "application/octet-stream" : item.mimeType;
+                    createdDocument = DocumentsContract.createDocument(
+                        getContentResolver(), treeUri, mimeType, fileName);
+                    if (createdDocument == null) throw new IOException("Document provider returned no URI");
+                    try (InputStream input = new FileInputStream(itemFile(item.id));
+                         OutputStream output = getContentResolver().openOutputStream(createdDocument, "w")) {
+                        if (output == null) throw new IOException("Document provider returned no output stream");
+                        byte[] buffer = new byte[8192];
+                        int count;
+                        while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                    }
+                    saved++;
+                } catch (Exception exception) {
+                    if (createdDocument != null) {
+                        try {
+                            DocumentsContract.deleteDocument(getContentResolver(), createdDocument);
+                        } catch (Exception ignored) { }
+                    }
+                    failed++;
+                }
+            }
+            int savedCount = saved;
+            int failedCount = failed;
+            runOnUiThread(() -> {
+                archivingItems = false;
+                updateSelectionState();
+                toast(savedCount + "개 보관 완료" + (failedCount == 0 ? "" : ", " + failedCount + "개 실패"));
+            });
+        }, "share-stack-folder-archive").start();
+    }
+
+    private Set<String> existingArchiveNames(Uri treeUri) {
+        HashSet<String> names = new HashSet<>();
+        try {
+            Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+                treeUri, DocumentsContract.getTreeDocumentId(treeUri));
+            try (Cursor cursor = getContentResolver().query(childrenUri,
+                new String[] {DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null)) {
+                if (cursor != null) {
+                    int nameColumn = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
+                    while (nameColumn >= 0 && cursor.moveToNext()) {
+                        String name = cursor.getString(nameColumn);
+                        if (name != null) names.add(name.toLowerCase(Locale.ROOT));
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // ponytail: some document providers cannot list children; use provider create semantics for collisions.
+        }
+        return names;
+    }
+
+    private String archiveFileName(StackItem item) {
+        String name;
+        if ("text/plain".equals(item.mimeType)) {
+            String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+                .format(new Date(item.createdAt));
+            name = "텍스트_" + timestamp + ".txt";
+        } else {
+            name = item.name == null ? "파일" : item.name;
+        }
+        name = name.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_").trim();
+        while (name.endsWith(".")) name = name.substring(0, name.length() - 1).trim();
+        return name.isEmpty() ? "파일" : name;
+    }
+
+    private String uniqueArchiveName(String originalName, Set<String> existingNames) {
+        int extensionIndex = originalName.lastIndexOf('.');
+        if (extensionIndex <= 0) extensionIndex = originalName.length();
+        String base = originalName.substring(0, extensionIndex);
+        String extension = originalName.substring(extensionIndex);
+        String candidate = originalName;
+        int suffix = 1;
+        while (existingNames.contains(candidate.toLowerCase(Locale.ROOT))) {
+            candidate = base + " (" + suffix++ + ")" + extension;
+        }
+        existingNames.add(candidate.toLowerCase(Locale.ROOT));
+        return candidate;
     }
 
     @SuppressWarnings("deprecation")
@@ -444,6 +654,24 @@ public final class MainActivity extends Activity {
             if (cursor != null && cursor.moveToFirst()) { int column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME); if (column >= 0) return cursor.getString(column); }
         } catch (Exception ignored) { }
         return uri.getLastPathSegment() == null ? "공유 항목" : uri.getLastPathSegment();
+    }
+
+    private void toggleAllItems() {
+        boolean allSelected = !items.isEmpty();
+        for (StackItem item : items) {
+            if (!isItemSelected(item)) {
+                allSelected = false;
+                break;
+            }
+        }
+        boolean selectAll = !allSelected;
+        selectedItemIds.clear();
+        if (selectAll) {
+            for (StackItem item : items) selectedItemIds.add(item.id);
+        }
+        for (CheckBox selection : selections) selection.setChecked(selectAll);
+        selectionsInitialized = true;
+        render();
     }
 
     private void render() {
@@ -510,7 +738,9 @@ public final class MainActivity extends Activity {
         card.setElevation(dp(2));
         card.setClipToOutline(true);
 
-        card.addView(previewFor(item), new FrameLayout.LayoutParams(-1, -1));
+        View preview = previewFor(item);
+        preview.setOnClickListener(v -> showItemDetails(item));
+        card.addView(preview, new FrameLayout.LayoutParams(-1, -1));
         CheckBox box = newSelectionBox(item);
         card.addView(box, new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.TOP | Gravity.END));
         TextView typeChip = new TextView(this);
@@ -537,9 +767,11 @@ public final class MainActivity extends Activity {
         name.setMaxLines(1);
         name.setSingleLine(true);
         name.setEllipsize(TextUtils.TruncateAt.END);
+        applyLockIndicator(name, item);
         details.addView(name);
         card.addView(details, new FrameLayout.LayoutParams(-1, dp(44), Gravity.BOTTOM));
         card.setOnClickListener(v -> box.setChecked(!box.isChecked()));
+        enableReorder(card, item);
 
         LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(0, -1, 1);
         cardParams.setMargins(firstInRow ? 0 : dp(5), 0, firstInRow ? dp(5) : 0, 0);
@@ -559,10 +791,12 @@ public final class MainActivity extends Activity {
         name.setEllipsize(TextUtils.TruncateAt.END);
         name.setGravity(Gravity.CENTER_VERTICAL);
         name.setPadding(dp(14), 0, dp(48), 0);
+        applyLockIndicator(name, item);
         compact.addView(name, new FrameLayout.LayoutParams(-1, -1));
         CheckBox box = newSelectionBox(item);
         compact.addView(box, new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER_VERTICAL | Gravity.END));
         compact.setOnClickListener(v -> box.setChecked(!box.isChecked()));
+        enableReorder(compact, item);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(54));
         params.setMargins(0, 0, 0, dp(8));
         list.addView(compact, params);
@@ -580,7 +814,9 @@ public final class MainActivity extends Activity {
         FrameLayout previewArea = new FrameLayout(this);
         previewArea.setBackground(roundedBackground(0xfff1f3f4, 0, 12));
         previewArea.setClipToOutline(true);
-        previewArea.addView(previewFor(item), new FrameLayout.LayoutParams(-1, -1));
+        View preview = previewFor(item);
+        preview.setOnClickListener(v -> showItemDetails(item));
+        previewArea.addView(preview, new FrameLayout.LayoutParams(-1, -1));
         CheckBox box = newSelectionBox(item);
         content.addView(previewArea, new LinearLayout.LayoutParams(dp(108), dp(76)));
 
@@ -595,6 +831,7 @@ public final class MainActivity extends Activity {
         name.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         name.setSingleLine(true);
         name.setEllipsize(TextUtils.TruncateAt.END);
+        applyLockIndicator(name, item);
         TextView type = new TextView(this);
         type.setText(contentTypeLabel(item.mimeType));
         type.setTextSize(13);
@@ -608,6 +845,7 @@ public final class MainActivity extends Activity {
         boxParams.setMargins(0, -dp(12), -dp(12), 0);
         card.addView(box, boxParams);
         card.setOnClickListener(v -> box.setChecked(!box.isChecked()));
+        enableReorder(card, item);
 
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(92));
         params.setMargins(0, 0, 0, dp(10));
@@ -632,6 +870,139 @@ public final class MainActivity extends Activity {
         });
         selections.add(box);
         return box;
+    }
+
+    private void enableReorder(View surface, StackItem item) {
+        surface.setOnLongClickListener(view -> {
+            ClipData data = ClipData.newPlainText("Share Stack item", item.id);
+            view.startDragAndDrop(data, new View.DragShadowBuilder(view), item.id, 0);
+            return true;
+        });
+        surface.setOnDragListener((view, event) -> {
+            String draggedId = event.getLocalState() instanceof String ? (String) event.getLocalState() : null;
+            if (draggedId == null || draggedId.equals(item.id)) return false;
+            if (event.getAction() == DragEvent.ACTION_DRAG_ENTERED) {
+                view.setAlpha(0.62f);
+                return true;
+            }
+            if (event.getAction() == DragEvent.ACTION_DRAG_EXITED || event.getAction() == DragEvent.ACTION_DRAG_ENDED) {
+                view.setAlpha(1f);
+                return true;
+            }
+            if (event.getAction() == DragEvent.ACTION_DROP) {
+                view.setAlpha(1f);
+                reorderItem(draggedId, item.id);
+                return true;
+            }
+            return true;
+        });
+    }
+
+    private void reorderItem(String draggedId, String targetId) {
+        int from = -1;
+        int to = -1;
+        for (int index = 0; index < items.size(); index++) {
+            if (draggedId.equals(items.get(index).id)) from = index;
+            if (targetId.equals(items.get(index).id)) to = index;
+        }
+        if (from < 0 || to < 0 || from == to) return;
+        StackItem dragged = items.remove(from);
+        if (from < to) to--;
+        items.add(to, dragged);
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(SORT_MODE, SORT_MANUAL).apply();
+        saveItems();
+        render();
+    }
+
+    private void showItemDetails(StackItem item) {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(20), dp(8), dp(20), 0);
+        View preview = detailPreviewFor(item);
+        panel.addView(preview, new LinearLayout.LayoutParams(-1, dp(260)));
+        TextView name = new TextView(this);
+        name.setText(item.name);
+        name.setTextColor(INK);
+        name.setTextSize(17);
+        name.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        name.setPadding(0, dp(16), 0, dp(4));
+        panel.addView(name);
+        TextView type = new TextView(this);
+        type.setText(contentTypeLabel(item.mimeType));
+        type.setTextColor(MUTED);
+        type.setTextSize(14);
+        panel.addView(type);
+        if ("text/plain".equals(item.mimeType)) {
+            TextView text = new TextView(this);
+            text.setText(readText(item));
+            text.setTextColor(INK);
+            text.setTextSize(15);
+            text.setPadding(0, dp(12), 0, 0);
+            ScrollView textScroll = new ScrollView(this);
+            textScroll.addView(text);
+            panel.addView(textScroll, new LinearLayout.LayoutParams(-1, dp(180)));
+        }
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setTitle("항목 미리보기")
+            .setView(panel)
+            .setNegativeButton("삭제", null)
+            .setNeutralButton(item.locked ? "잠금 해제" : "잠금 보관", null)
+            .setPositiveButton("닫기", null)
+            .create();
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(view -> new AlertDialog.Builder(this)
+                .setMessage("이 항목을 삭제할까요?")
+                .setNegativeButton("취소", null)
+                .setPositiveButton("삭제", (confirm, which) -> {
+                    itemFile(item.id).delete();
+                    items.remove(item);
+                    selectedItemIds.remove(item.id);
+                    saveItems();
+                    dialog.dismiss();
+                    render();
+                })
+                .show());
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
+                setItemLocked(item, !item.locked);
+                dialog.dismiss();
+            });
+        });
+        dialog.show();
+    }
+
+    private void setItemLocked(StackItem item, boolean locked) {
+        for (int index = 0; index < items.size(); index++) {
+            if (items.get(index).id.equals(item.id)) {
+                items.set(index, item.withLocked(locked));
+                saveItems();
+                render();
+                toast(locked ? "항목을 잠금 보관했습니다" : "항목 잠금을 해제했습니다");
+                return;
+            }
+        }
+    }
+
+    private String readText(StackItem item) {
+        try (FileInputStream input = new FileInputStream(itemFile(item.id))) {
+            byte[] bytes = new byte[input.available()];
+            int length = input.read(bytes);
+            return length > 0 ? new String(bytes, 0, length, StandardCharsets.UTF_8) : "";
+        } catch (IOException ignored) {
+            return "텍스트를 불러올 수 없습니다";
+        }
+    }
+
+    private View detailPreviewFor(StackItem item) {
+        Bitmap bitmap = null;
+        if (item.mimeType.startsWith("image/")) bitmap = imageThumbnail(itemFile(item.id));
+        else if (item.mimeType.startsWith("video/")) bitmap = videoThumbnail(itemFile(item.id));
+        else if ("application/pdf".equals(item.mimeType)) bitmap = pdfThumbnail(itemFile(item.id));
+        if (bitmap == null) return previewTile(item);
+        ImageView image = new ImageView(this);
+        image.setImageBitmap(bitmap);
+        image.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        image.setBackgroundColor(0xfff1f3f4);
+        return image;
     }
 
     private boolean isThumbnailCapable(StackItem item) {
@@ -773,6 +1144,54 @@ public final class MainActivity extends Activity {
         button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x26000000), roundedBackground(fill, stroke, radius), null));
     }
 
+    private void styleCompactSettingsButton(Button button, int fill, int textColor, int stroke, int radius, int textSize) {
+        styleButton(button, fill, textColor, stroke, radius, textSize);
+        button.setMinimumHeight(0);
+        button.setMinHeight(0);
+        button.setPadding(dp(10), 0, dp(10), 0);
+        button.setTypeface(Typeface.DEFAULT);
+        button.setStateListAnimator(null);
+        button.setElevation(0);
+        button.setTranslationZ(0);
+    }
+
+    private void stylePlainSettingsButton(Button button) {
+        button.setAllCaps(false);
+        button.setTextSize(14);
+        button.setTypeface(Typeface.DEFAULT);
+        button.setTextColor(INK);
+        button.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        button.setPadding(dp(2), 0, dp(2), 0);
+        button.setMinWidth(0);
+        button.setMinimumWidth(0);
+        button.setMinimumHeight(0);
+        button.setMinHeight(0);
+        button.setStateListAnimator(null);
+        button.setElevation(0);
+        button.setTranslationZ(0);
+        button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x18000000),
+            new ColorDrawable(Color.TRANSPARENT), null));
+    }
+
+    private void addSettingsSection(LinearLayout panel, String text) {
+        TextView section = new TextView(this);
+        section.setText(text);
+        section.setTextSize(12);
+        section.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        section.setTextColor(MUTED);
+        section.setGravity(Gravity.BOTTOM);
+        section.setPadding(dp(2), dp(14), 0, dp(4));
+        panel.addView(section, new LinearLayout.LayoutParams(-1, dp(36)));
+    }
+
+    private void addSettingsDivider(LinearLayout panel) {
+        View divider = new View(this);
+        divider.setBackgroundColor(BORDER);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(1));
+        params.setMargins(dp(2), 0, 0, 0);
+        panel.addView(divider, params);
+    }
+
     private void styleIconButton(ImageButton button, int icon, String description) {
         button.setImageResource(icon);
         button.setContentDescription(description);
@@ -803,15 +1222,19 @@ public final class MainActivity extends Activity {
 
     private void updateSelectionState() {
         int selectedCount = 0;
-        for (CheckBox selection : selections) if (selection.isChecked()) selectedCount++;
-        if (viewButton != null) {
-            boolean listMode = isListMode();
-            viewButton.setImageResource(listMode ? R.drawable.ic_view_grid : R.drawable.ic_view_list);
-            viewButton.setContentDescription(listMode ? "카드 보기로 전환" : "목록 보기로 전환");
-        }
+        for (StackItem item : items) if (isItemSelected(item)) selectedCount++;
         if (selectionSummary != null) {
             selectionSummary.setText(selectedCount == 0 ? items.size() + "개" : selectedCount + "개 선택됨");
             selectionSummary.setTextColor(PRIMARY_DARK);
+        }
+        if (selectionToggleButton != null) {
+            boolean hasItems = !items.isEmpty();
+            boolean allSelected = hasItems && selectedCount == items.size();
+            selectionToggleButton.setEnabled(hasItems);
+            selectionToggleButton.setText(allSelected ? "전체 해제" : "전체 선택");
+            styleActionButton(selectionToggleButton,
+                hasItems ? (allSelected ? 0xfff2f4f7 : 0xffeef3ff) : 0xffeff2f6,
+                hasItems ? (allSelected ? MUTED : PRIMARY_DARK) : 0xff66758d, 0, 14, 12);
         }
         if (shareButton != null) {
             boolean canShare = selectedCount > 0;
@@ -828,15 +1251,26 @@ public final class MainActivity extends Activity {
         }
         if (copyButton != null) {
             boolean hasSelectedText = false;
+            boolean hasSelectedFile = false;
             for (StackItem item : items) {
-                if (isItemSelected(item) && "text/plain".equals(item.mimeType)) {
-                    hasSelectedText = true;
-                    break;
+                if (isItemSelected(item)) {
+                    if (!"text/plain".equals(item.mimeType)) hasSelectedFile = true;
+                    if ("text/plain".equals(item.mimeType)) hasSelectedText = true;
                 }
             }
-            copyButton.setEnabled(hasSelectedText);
-            styleActionButton(copyButton, hasSelectedText ? 0xffeef3ff : 0xffeff2f6, hasSelectedText ? PRIMARY_DARK : 0xff66758d, 0, 14, 12);
+            boolean canCopy = hasSelectedFile || hasSelectedText;
+            copyButton.setEnabled(canCopy);
+            copyButton.setText(hasSelectedFile ? "파일 복사" : "텍스트 복사");
+            styleActionButton(copyButton, canCopy ? 0xffeef3ff : 0xffeff2f6, canCopy ? PRIMARY_DARK : 0xff66758d, 0, 14, 12);
             copyButton.setAlpha(1f);
+        }
+        if (archiveButton != null) {
+            boolean canArchive = selectedCount > 0 && !archivingItems;
+            archiveButton.setEnabled(canArchive);
+            archiveButton.setText(archivingItems ? "저장 중" : "보관");
+            styleActionButton(archiveButton, canArchive ? 0xffeef3ff : 0xffeff2f6,
+                canArchive ? PRIMARY_DARK : 0xff66758d, 0, 14, 12);
+            archiveButton.setContentDescription("선택 항목을 보관 폴더에 저장");
         }
     }
 
@@ -850,6 +1284,45 @@ public final class MainActivity extends Activity {
             requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, BADGE_PERMISSION_REQUEST);
         } else {
             updateStackBadge();
+        }
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != ARCHIVE_FOLDER_REQUEST) return;
+        ArrayList<String> itemIdsToArchive = pendingArchiveItemIds;
+        pendingArchiveItemIds = null;
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+
+        Uri treeUri = data.getData();
+        int grantFlags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION
+            | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        if ((grantFlags & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) == 0) {
+            toast("선택한 폴더에 쓸 권한이 없습니다");
+            return;
+        }
+        try {
+            getContentResolver().takePersistableUriPermission(treeUri, grantFlags);
+        } catch (SecurityException exception) {
+            toast("폴더 접근 권한을 저장할 수 없습니다");
+            return;
+        }
+
+        String folderName = archiveFolderName(treeUri);
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString(ARCHIVE_FOLDER_URI, treeUri.toString())
+            .putString(ARCHIVE_FOLDER_NAME, folderName)
+            .apply();
+        if (archiveFolderSettingButton != null) {
+            updateArchiveFolderButton(archiveFolderSettingButton);
+        }
+        if (itemIdsToArchive != null && !itemIdsToArchive.isEmpty()) {
+            ArrayList<StackItem> chosen = new ArrayList<>();
+            for (StackItem item : items) {
+                if (itemIdsToArchive.contains(item.id)) chosen.add(item);
+            }
+            if (chosen.isEmpty()) toast("보관할 스택 항목을 찾을 수 없습니다");
+            else archiveItems(chosen, treeUri);
         }
     }
 
@@ -914,7 +1387,7 @@ public final class MainActivity extends Activity {
             if (text.isEmpty()) { toast("공유할 내용을 찾을 수 없습니다"); return; }
             copyTextToClipboard(text);
             toast("텍스트를 클립보드에 복사했습니다");
-            if (clearAfterShare) clearStack();
+            if (clearAfterShare) clearUnlockedStack();
             return;
         }
         String sendType;
@@ -966,11 +1439,32 @@ public final class MainActivity extends Activity {
         return type;
     }
 
-    private void copySelectedText() {
-        String text = selectedText(selected());
+    private void copySelectedContent() {
+        List<StackItem> selected = selected();
+        ArrayList<StackItem> files = new ArrayList<>();
+        for (StackItem item : selected) if (!"text/plain".equals(item.mimeType)) files.add(item);
+        if (!files.isEmpty()) {
+            copyFilesToClipboard(files);
+            return;
+        }
+        String text = selectedText(selected);
         if (text.isEmpty()) { toast("선택한 항목에 텍스트가 없습니다"); return; }
         copyTextToClipboard(text);
         toast("텍스트를 클립보드에 복사했습니다");
+    }
+
+    private void copyFilesToClipboard(List<StackItem> files) {
+        StackItem first = files.get(0);
+        Uri firstUri = contentUri("", first.id, first.name, first.mimeType);
+        ClipData clip = new ClipData("Share Stack files",
+            new String[]{commonType(files)}, new ClipData.Item(firstUri));
+        for (int index = 1; index < files.size(); index++) {
+            StackItem file = files.get(index);
+            clip.addItem(getContentResolver(), new ClipData.Item(
+                contentUri("", file.id, file.name, file.mimeType)));
+        }
+        ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(clip);
+        toast(files.size() + "개의 파일을 클립보드에 복사했습니다");
     }
 
     private void copyTextToClipboard(String text) {
@@ -995,9 +1489,11 @@ public final class MainActivity extends Activity {
         for (StackItem item : selected) new File(getFilesDir(), "items/" + item.id).delete(); items.removeAll(selected); saveItems(); render();
     }
 
-    private void clearStack() {
-        for (StackItem item : items) itemFile(item.id).delete();
-        items.clear(); saveItems(); render();
+    private void clearUnlockedStack() {
+        StackStore.removeUnlocked(this);
+        items.clear();
+        loadItems();
+        render();
     }
 
     private String copyForSharing(StackItem item) {
@@ -1048,6 +1544,12 @@ public final class MainActivity extends Activity {
     private void loadItems() {
         cleanupExpiredSharedFiles();
         items.addAll(StackStore.load(this));
+        int sortMode = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(SORT_MODE, SORT_MANUAL);
+        if (sortMode == SORT_NEWEST) {
+            java.util.Collections.sort(items, (first, second) -> Long.compare(second.createdAt, first.createdAt));
+        } else if (sortMode == SORT_OLDEST) {
+            java.util.Collections.sort(items, (first, second) -> Long.compare(first.createdAt, second.createdAt));
+        }
     }
 
     private void saveItems() {
@@ -1068,6 +1570,11 @@ public final class MainActivity extends Activity {
         if (mimeType.startsWith("audio/")) return "오디오";
         if ("application/pdf".equals(mimeType)) return "PDF 문서";
         return "파일";
+    }
+    private void applyLockIndicator(TextView view, StackItem item) {
+        if (!item.locked) return;
+        view.setCompoundDrawablesWithIntrinsicBounds(0, 0, R.drawable.ic_lock, 0);
+        view.setCompoundDrawablePadding(dp(6));
     }
     private String shorten(String text) { return text.length() > 80 ? text.substring(0, 77) + "…" : text; }
     private void toast(String message) { Toast.makeText(this, message, Toast.LENGTH_SHORT).show(); }

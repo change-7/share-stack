@@ -19,10 +19,13 @@ import java.util.List;
 import java.util.UUID;
 
 public final class NotificationShareActivity extends Activity {
+    static final String EXTRA_FORCE_SHARE = "force_share";
+
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         if (getSharedPreferences(StackStore.PREFS, MODE_PRIVATE)
-            .getBoolean(StackStore.SHOW_NOTIFICATION_SHARE_ACTION, false)) {
+            .getBoolean(StackStore.SHOW_NOTIFICATION_SHARE_ACTION, false)
+            || getIntent().getBooleanExtra(EXTRA_FORCE_SHARE, false)) {
             shareAll();
         }
         finish();
@@ -39,7 +42,7 @@ public final class NotificationShareActivity extends Activity {
         for (StackItem item : items) if (!"text/plain".equals(item.mimeType)) files.add(item);
         if (files.isEmpty()) {
             if (!text.isEmpty()) copyText(text);
-            if (clearAfterShare) clearStack(items);
+            if (clearAfterShare) clearUnlockedStack();
             return;
         }
         for (StackItem item : files) {
@@ -111,10 +114,8 @@ public final class NotificationShareActivity extends Activity {
             .setPrimaryClip(ClipData.newPlainText("Share Stack", text));
     }
 
-    private void clearStack(List<StackItem> items) {
-        for (StackItem item : items) itemFile(item.id).delete();
-        StackStore.save(this, new ArrayList<>());
-        StackBadge.update(this, 0);
+    private void clearUnlockedStack() {
+        StackBadge.update(this, StackStore.removeUnlocked(this));
     }
 
     private File itemFile(String id) {

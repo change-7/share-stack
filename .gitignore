@@ -2,3 +2,7 @@
 app/build/
 build/
 .DS_Store
+.build/
+DerivedData/
+xcuserdata/
+*.xcuserstate

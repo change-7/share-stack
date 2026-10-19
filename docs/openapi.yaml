@@ -1,0 +1,231 @@
+openapi: 3.0.3
+info:
+  title: Share Stack Control API
+  version: 1.0.0
+  description: HTTPS with certificate SHA-256 pinning and the paired device bearer token.
+servers:
+  - url: https://127.0.0.1:8765
+security:
+  - bearerAuth: []
+paths:
+  /v1/status:
+    get:
+      operationId: getStatus
+      responses:
+        '200':
+          description: API version, addresses, inboxCount, outboxCount and receiptSettings.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  apiVersion: {type: integer}
+                  inboxCount: {type: integer}
+                  outboxCount: {type: integer}
+                  addresses: {type: array, items: {type: string}}
+                  receiptSettings:
+                    type: object
+                    properties:
+                      mode: {type: string, enum: [inbox, automatic]}
+                      folderPath: {type: string}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/inbox:
+    get:
+      operationId: listInbox
+      responses:
+        '200': {$ref: '#/components/responses/Items'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/inbox/{id}/accept:
+    parameters:
+      - {$ref: '#/components/parameters/ItemID'}
+    post:
+      operationId: acceptItem
+      responses:
+        '200':
+          description: Saved item. Repeated acceptance returns the same item.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Item'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/inbox/accept-all:
+    post:
+      operationId: acceptAllItems
+      responses:
+        '200':
+          description: Partial failure is represented by the failed array.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [saved, failed]
+                properties:
+                  saved:
+                    type: array
+                    items: {$ref: '#/components/schemas/Item'}
+                  failed:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, error]
+                      properties:
+                        id: {type: string}
+                        error: {type: string}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/inbox/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/ItemID'}
+    delete:
+      operationId: cancelItem
+      responses:
+        '200':
+          description: Temporary file and inbox entry deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  status: {type: string, enum: [cancelled]}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/history:
+    get:
+      operationId: listHistory
+      parameters:
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+        - in: query
+          name: offset
+          schema: {type: integer, minimum: 0, default: 0}
+      responses:
+        '200': {$ref: '#/components/responses/Items'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/events:
+    get:
+      operationId: listEvents
+      parameters:
+        - in: query
+          name: after
+          schema: {type: integer, minimum: 0}
+        - in: query
+          name: streamID
+          description: Required when after is supplied. Reset or expired cursors return 409.
+          schema: {type: string}
+      responses:
+        '200':
+          description: Polling feed. Last 200 events retained in memory, max 100 per page.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [streamID, nextCursor, hasMore, events]
+                properties:
+                  streamID: {type: string}
+                  nextCursor: {type: integer}
+                  hasMore: {type: boolean}
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      required: [sequence, type, itemID, createdAt]
+                      properties:
+                        sequence: {type: integer}
+                        type: {type: string, enum: [file.received, file.saved, file.cancelled, file.save_failed]}
+                        itemID: {type: string}
+                        createdAt: {type: number, description: Seconds since 2001-01-01 UTC.}
+                        error: {type: string}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/outbox/text:
+    post:
+      operationId: enqueueText
+      requestBody:
+        required: true
+        description: UTF-8 JSON body, at most 1 MiB.
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: {type: string, minLength: 1}
+      responses:
+        '201':
+          description: Queued for the phone to fetch.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Item'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/outbox/files:
+    post:
+      operationId: enqueueFile
+      parameters:
+        - in: header
+          name: X-Item-Name
+          required: true
+          schema: {type: string}
+          description: Base64url UTF-8 filename.
+        - in: header
+          name: X-Item-Mime
+          required: true
+          schema: {type: string}
+          description: Base64url UTF-8 MIME type.
+        - in: header
+          name: X-Item-SHA256
+          required: true
+          schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+      requestBody:
+        required: true
+        description: Raw file with Content-Length. Maximum 20 GiB.
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        '201':
+          description: Queued for the phone to fetch.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Item'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    ItemID:
+      in: path
+      name: id
+      required: true
+      schema: {type: string, format: uuid}
+  responses:
+    Error:
+      description: 400 invalid input, 401 unauthorized, 404 not found, 409 conflict, or 500 internal error.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error: {type: string}
+    Items:
+      description: Newest items first.
+      content:
+        application/json:
+          schema:
+            type: array
+            items: {$ref: '#/components/schemas/Item'}
+  schemas:
+    Item:
+      type: object
+      required: [id, name, mimeType, size, sha256, origin, state, createdAt]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        mimeType: {type: string}
+        size: {type: integer, format: int64}
+        sha256: {type: string}
+        origin: {type: string, enum: [mac, galaxy]}
+        state: {type: string, enum: [pending, delivered, received, awaitingAcceptance, saved]}
+        createdAt: {type: number, description: Seconds since 2001-01-01 UTC.}
+        savedPath: {type: string}
+        saveError: {type: string}

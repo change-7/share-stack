@@ -26,6 +26,7 @@ final class StackStore {
     static final String KEEP_STACK_NOTIFICATION = "keep_stack_notification";
     static final String AUTO_EXPIRY_DAYS = "auto_expiry_days";
     static final String SAVE_URL_WITH_MEDIA = "save_url_with_media";
+    static final long MAXIMUM_TRANSFER_SIZE = 20L * 1024 * 1024 * 1024;
 
     private StackStore() { }
 
@@ -63,13 +64,13 @@ final class StackStore {
         return result;
     }
 
-    static void save(Context context, ArrayList<StackItem> items) {
+    static boolean save(Context context, ArrayList<StackItem> items) {
         StringBuilder data = new StringBuilder();
         for (StackItem item : items) {
             if (data.length() > 0) data.append('\n');
             data.append(item.serialize());
         }
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(ITEMS, data.toString()).commit();
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(ITEMS, data.toString()).commit();
     }
 
     static int remove(Context context, ArrayList<String> itemIds) {
@@ -133,6 +134,127 @@ final class StackStore {
         return new File(itemDirectory(context), id);
     }
 
+    static File partialDownloadFile(Context context, String remoteId, long totalSize) throws IOException {
+        if (remoteId == null || !remoteId.matches("[a-fA-F0-9-]{36}")
+            || totalSize < 0 || totalSize > MAXIMUM_TRANSFER_SIZE) {
+            throw new IOException("Mac 파일 정보가 올바르지 않습니다");
+        }
+        File directory = new File(context.getFilesDir(), "downloads");
+        if (!directory.isDirectory() && !directory.mkdirs()) throw new IOException("이어받기 폴더를 만들지 못했습니다");
+        File partial = new File(directory, remoteId + ".part");
+        if (partial.isFile() && partial.length() > totalSize && !partial.delete()) {
+            throw new IOException("잘못된 임시 파일을 지우지 못했습니다");
+        }
+        if (!partial.exists() && !partial.createNewFile()) throw new IOException("이어받기 파일을 만들지 못했습니다");
+        return partial;
+    }
+
+    static void appendDownloadedRange(DownloadChunk chunk, InputStream input) throws IOException {
+        if (chunk.offset < 0 || chunk.length <= 0 || chunk.length > 4 * 1024 * 1024
+            || chunk.offset != chunk.partial.length()) {
+            throw new IOException("다운로드 이어받기 위치가 올바르지 않습니다");
+        }
+        try (java.io.RandomAccessFile output = new java.io.RandomAccessFile(chunk.partial, "rw")) {
+            output.seek(chunk.offset);
+            byte[] buffer = new byte[64 * 1024];
+            int remaining = chunk.length;
+            while (remaining > 0) {
+                int count = input.read(buffer, 0, Math.min(buffer.length, remaining));
+                if (count == -1) throw new IOException("다운로드 조각이 완전히 도착하지 않았습니다");
+                output.write(buffer, 0, count);
+                remaining -= count;
+            }
+            if (input.read() != -1) throw new IOException("다운로드 조각이 예상 크기보다 큽니다");
+            output.getFD().sync();
+        }
+    }
+
+    static boolean finishDownloadedFile(Context context, File partial, DownloadMetadata metadata) throws IOException {
+        if (metadata.size < 0 || metadata.size > MAXIMUM_TRANSFER_SIZE
+            || !metadata.sha256.matches("[0-9a-f]{64}") || partial.length() != metadata.size) {
+            throw new IOException("받은 파일 정보가 올바르지 않습니다");
+        }
+        String actual = fingerprint(partial);
+        if (!metadata.sha256.equals(actual)) {
+            partial.delete();
+            throw new IOException("전송 파일 검증에 실패했습니다");
+        }
+        File destination = itemFile(context, UUID.randomUUID().toString());
+        try {
+            java.nio.file.Files.move(partial.toPath(), destination.toPath());
+        } catch (java.io.IOException exception) {
+            throw new IOException("받은 파일을 보관함으로 옮기지 못했습니다", exception);
+        }
+        ArrayList<StackItem> items = load(context);
+        boolean added = addUniqueItem(context, items, destination, metadata.mimeType, metadata.name);
+        if (added && !save(context, items)) {
+            destination.delete();
+            throw new IOException("받은 항목을 스택에 저장하지 못했습니다");
+        }
+        return added;
+    }
+
+    static final class DownloadChunk {
+        final File partial;
+        final long offset;
+        final int length;
+
+        DownloadChunk(File partial, long offset, int length) {
+            this.partial = partial;
+            this.offset = offset;
+            this.length = length;
+        }
+    }
+
+    static final class DownloadMetadata {
+        final String mimeType;
+        final String name;
+        final long size;
+        final String sha256;
+
+        DownloadMetadata(String mimeType, String name, long size, String sha256) {
+            this.mimeType = mimeType;
+            this.name = name;
+            this.size = size;
+            this.sha256 = sha256;
+        }
+    }
+
+    static boolean receiveDownloaded(Context context, InputStream input, String mimeType, String name,
+        long expectedSize, String expectedFingerprint) throws IOException {
+        if (expectedSize < 0 || expectedSize > MAXIMUM_TRANSFER_SIZE
+            || expectedFingerprint == null || !expectedFingerprint.matches("[0-9a-f]{64}")) {
+            throw new IOException("전송 파일 정보가 올바르지 않습니다");
+        }
+        ArrayList<StackItem> items = load(context);
+        File destination = itemFile(context, UUID.randomUUID().toString());
+        try (FileOutputStream output = new FileOutputStream(destination)) {
+            byte[] buffer = new byte[64 * 1024];
+            int count;
+            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+        } catch (IOException exception) {
+            destination.delete();
+            throw exception;
+        }
+        String actualFingerprint;
+        try {
+            actualFingerprint = fingerprint(destination);
+        } catch (IllegalStateException exception) {
+            destination.delete();
+            throw new IOException("받은 파일을 확인할 수 없습니다", exception);
+        }
+        if (destination.length() != expectedSize || !expectedFingerprint.equals(actualFingerprint)) {
+            destination.delete();
+            throw new IOException("전송 파일 검증에 실패했습니다");
+        }
+        boolean added = addUniqueItem(context, items, destination, mimeType, name);
+        if (added && !save(context, items)) {
+            destination.delete();
+            throw new IOException("받은 항목을 스택에 저장하지 못했습니다");
+        }
+        return added;
+    }
+
     private static File itemDirectory(Context context) {
         File directory = new File(context.getFilesDir(), "items");
         directory.mkdirs();
@@ -179,7 +301,7 @@ final class StackStore {
         return true;
     }
 
-    private static String fingerprint(File file) {
+    static String fingerprint(File file) {
         try (InputStream input = new java.io.FileInputStream(file)) {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] buffer = new byte[8192];

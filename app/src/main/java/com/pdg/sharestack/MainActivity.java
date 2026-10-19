@@ -30,7 +30,12 @@ import android.graphics.drawable.InsetDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.media.ThumbnailUtils;
 import android.net.Uri;
+import android.net.nsd.NsdManager;
+import android.net.nsd.NsdServiceInfo;
+import android.net.wifi.WifiManager;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
 import android.provider.MediaStore;
@@ -42,6 +47,7 @@ import android.view.View;
 import android.view.Window;
 import android.widget.Button;
 import android.widget.CheckBox;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.ImageButton;
@@ -60,8 +66,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.text.SimpleDateFormat;
@@ -111,6 +119,8 @@ public final class MainActivity extends Activity {
         loadItems();
         buildUi();
         requestBadgePermissionIfNeeded();
+        handlePairingIntent(getIntent());
+        getIntent().setData(null);
     }
 
     @Override public void onNewIntent(Intent intent) {
@@ -118,6 +128,31 @@ public final class MainActivity extends Activity {
         setIntent(intent);
         reloadItems();
         requestBadgePermissionIfNeeded();
+        handlePairingIntent(intent);
+        intent.setData(null);
+    }
+
+    private void handlePairingIntent(Intent intent) {
+        Uri pairing = intent == null ? null : intent.getData();
+        if (pairing == null || !"sharestack".equals(pairing.getScheme()) || !"pair".equals(pairing.getHost())) return;
+        String host = pairing.getQueryParameter("host");
+        String token = pairing.getQueryParameter("token");
+        String certificatePin = pairing.getQueryParameter("cert");
+        MacBridgeClient.Pairing credentials = new MacBridgeClient.Pairing(host, token, certificatePin);
+        if (!MacBridgeClient.isValidPairing(credentials)) {
+            toast("잘못된 Share Stack 페어링 QR 코드입니다");
+            return;
+        }
+        new AlertDialog.Builder(this)
+            .setTitle("Mac Share Stack 연결")
+            .setMessage(host + " 주소의 Mac을 안전한 연결 정보에 추가할까요?")
+            .setNegativeButton("취소", null)
+            .setPositiveButton("연결", (dialog, which) -> getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(MacBridgeClient.HOST, host)
+                .putString(MacBridgeClient.TOKEN, token)
+                .putString(MacBridgeClient.TLS_PIN, certificatePin)
+                .apply())
+            .show();
     }
 
     @Override public void onResume() {
@@ -161,6 +196,9 @@ public final class MainActivity extends Activity {
         ImageButton camera = new ImageButton(this);
         styleIconButton(camera, R.drawable.ic_camera, "카메라로 추가");
         camera.setOnClickListener(v -> startCapture());
+        ImageButton macBridge = new ImageButton(this);
+        styleIconButton(macBridge, R.drawable.ic_computer, "Mac과 전송");
+        macBridge.setOnClickListener(v -> showMacBridge());
         View toolbarSpacer = new View(this);
         ImageButton settings = new ImageButton(this);
         styleIconButton(settings, R.drawable.ic_settings, "설정");
@@ -181,6 +219,7 @@ public final class MainActivity extends Activity {
         toolbar.addView(toolbarSpacer, new LinearLayout.LayoutParams(0, dp(48), 1));
         toolbar.addView(selectionSummary, summaryParams);
         toolbar.addView(selectionToggleButton, selectionToggleParams);
+        toolbar.addView(macBridge, new LinearLayout.LayoutParams(dp(48), dp(48)));
         toolbar.addView(settings, new LinearLayout.LayoutParams(dp(48), dp(48)));
         LinearLayout.LayoutParams toolbarParams = new LinearLayout.LayoutParams(-1, dp(48));
         toolbarParams.setMargins(0, 0, 0, dp(12));
@@ -236,6 +275,267 @@ public final class MainActivity extends Activity {
         Intent capture = new Intent(this, CaptureActivity.class)
             .putExtra(CaptureActivity.EXTRA_CAPTURE_ID, java.util.UUID.randomUUID() + ".jpg");
         startActivity(capture);
+    }
+
+    private void showMacBridge() {
+        SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+        Dialog dialog = new Dialog(this);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(18), dp(18), dp(18), dp(14));
+        panel.setBackground(roundedBackground(SURFACE, BORDER, 20));
+
+        TextView title = new TextView(this);
+        title.setText("Mac 연동");
+        title.setTextSize(20);
+        title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        title.setTextColor(INK);
+        panel.addView(title);
+
+        TextView guidance = new TextView(this);
+        guidance.setText("같은 Wi-Fi에서 Mac을 찾거나 QR 코드로 연결하세요. 외부에서는 Tailscale을 사용할 수 있습니다.");
+        guidance.setTextSize(13);
+        guidance.setTextColor(MUTED);
+        LinearLayout.LayoutParams guidanceParams = new LinearLayout.LayoutParams(-1, -2);
+        guidanceParams.setMargins(0, dp(6), 0, dp(12));
+        panel.addView(guidance, guidanceParams);
+
+        EditText host = new EditText(this);
+        host.setSingleLine(true);
+        host.setTextSize(14);
+        host.setHint("Mac Wi-Fi 또는 Tailscale IPv4");
+        host.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+        host.setText(preferences.getString(MacBridgeClient.HOST, ""));
+        panel.addView(host, new LinearLayout.LayoutParams(-1, dp(48)));
+
+        Button discover = new Button(this);
+        discover.setText("같은 Wi-Fi에서 Mac 찾기");
+        styleActionButton(discover, 0xffeef3ff, PRIMARY_DARK, 0, 12, 13);
+        LinearLayout.LayoutParams discoverParams = new LinearLayout.LayoutParams(-1, dp(42));
+        discoverParams.setMargins(0, dp(4), 0, dp(4));
+        panel.addView(discover, discoverParams);
+
+        EditText token = new EditText(this);
+        token.setSingleLine(true);
+        token.setTextSize(14);
+        token.setHint("짝 토큰");
+        token.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        token.setText(preferences.getString(MacBridgeClient.TOKEN, ""));
+        panel.addView(token, new LinearLayout.LayoutParams(-1, dp(48)));
+
+        EditText certificatePin = new EditText(this);
+        certificatePin.setSingleLine(true);
+        certificatePin.setTextSize(12);
+        certificatePin.setHint("Mac TLS 지문 (QR 연결 권장)");
+        certificatePin.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        certificatePin.setText(preferences.getString(MacBridgeClient.TLS_PIN, ""));
+        panel.addView(certificatePin, new LinearLayout.LayoutParams(-1, dp(48)));
+
+        TextView status = new TextView(this);
+        status.setText("파일과 텍스트를 양방향으로 전송합니다.");
+        status.setTextSize(12);
+        status.setTextColor(MUTED);
+        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-1, -2);
+        statusParams.setMargins(0, dp(8), 0, dp(10));
+        panel.addView(status, statusParams);
+
+        LinearLayout actions = new LinearLayout(this);
+        Button send = new Button(this);
+        send.setText("선택 보내기");
+        styleActionButton(send, PRIMARY, Color.WHITE, 0, 14, 13);
+        Button receive = new Button(this);
+        receive.setText("받기");
+        styleActionButton(receive, 0xffeef3ff, PRIMARY_DARK, 0, 14, 13);
+        LinearLayout.LayoutParams actionParams = new LinearLayout.LayoutParams(0, dp(46), 1);
+        actionParams.setMargins(0, 0, dp(4), 0);
+        actions.addView(send, actionParams);
+        LinearLayout.LayoutParams receiveParams = new LinearLayout.LayoutParams(0, dp(46), 1);
+        receiveParams.setMargins(dp(4), 0, 0, 0);
+        actions.addView(receive, receiveParams);
+        panel.addView(actions);
+
+        LinearLayout footer = new LinearLayout(this);
+        footer.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        Button save = new Button(this);
+        save.setText("저장");
+        styleActionButton(save, 0xffeef3ff, PRIMARY_DARK, 0, 14, 13);
+        Button close = new Button(this);
+        close.setText("닫기");
+        styleActionButton(close, SURFACE, INK, 0, 14, 13);
+        footer.addView(save, new LinearLayout.LayoutParams(dp(88), dp(42)));
+        footer.addView(close, new LinearLayout.LayoutParams(dp(76), dp(42)));
+        LinearLayout.LayoutParams footerParams = new LinearLayout.LayoutParams(-1, -2);
+        footerParams.setMargins(0, dp(6), 0, 0);
+        panel.addView(footer, footerParams);
+
+        save.setOnClickListener(v -> {
+            preferences.edit()
+                .putString(MacBridgeClient.HOST, host.getText().toString().trim())
+                .putString(MacBridgeClient.TOKEN, token.getText().toString().trim())
+                .putString(MacBridgeClient.TLS_PIN, certificatePin.getText().toString().trim().toLowerCase(Locale.ROOT))
+                .apply();
+            status.setText("Mac 연결 정보를 저장했습니다.");
+        });
+        close.setOnClickListener(v -> dialog.dismiss());
+        discover.setOnClickListener(v -> discoverMacOnWifi(host, status, discover));
+        send.setOnClickListener(v -> runMacTransfer(host, token, certificatePin, status, send, receive, true));
+        receive.setOnClickListener(v -> runMacTransfer(host, token, certificatePin, status, send, receive, false));
+
+        dialog.setContentView(panel);
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            window.setLayout(Math.min(getResources().getDisplayMetrics().widthPixels - dp(36), dp(420)), -2);
+        }
+        dialog.show();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            dialog.getWindow().setLayout(Math.min(getResources().getDisplayMetrics().widthPixels - dp(36), dp(420)), -2);
+        }
+    }
+
+    private void discoverMacOnWifi(EditText hostField, TextView status, Button button) {
+        NsdManager manager = (NsdManager) getSystemService(Context.NSD_SERVICE);
+        WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (manager == null || wifi == null) {
+            status.setText("Wi-Fi 기기 검색을 사용할 수 없습니다.");
+            return;
+        }
+        button.setEnabled(false);
+        WifiManager.MulticastLock multicastLock = wifi.createMulticastLock("share-stack-discovery");
+        multicastLock.setReferenceCounted(false);
+        try {
+            multicastLock.acquire();
+        } catch (RuntimeException exception) {
+            status.setText("Wi-Fi 기기 검색 권한이 필요합니다.");
+            button.setEnabled(true);
+            return;
+        }
+
+        Handler handler = new Handler(Looper.getMainLooper());
+        Map<String, String> found = new LinkedHashMap<>();
+        boolean[] finished = { false };
+        boolean[] resolving = { false };
+        NsdManager.DiscoveryListener[] listenerHolder = new NsdManager.DiscoveryListener[1];
+        Runnable[] finishHolder = new Runnable[1];
+        NsdManager.DiscoveryListener listener = new NsdManager.DiscoveryListener() {
+            @Override public void onDiscoveryStarted(String serviceType) {
+                status.setText("같은 Wi-Fi에서 Mac 검색 중…");
+            }
+
+            @Override public void onServiceFound(NsdServiceInfo service) {
+                if (service.getServiceType() == null || !service.getServiceType().startsWith("_sharestack._tcp")) return;
+                synchronized (resolving) {
+                    if (resolving[0]) return;
+                    resolving[0] = true;
+                }
+                try {
+                    manager.resolveService(service, new NsdManager.ResolveListener() {
+                    @Override public void onResolveFailed(NsdServiceInfo failedService, int errorCode) {
+                        synchronized (resolving) { resolving[0] = false; }
+                    }
+
+                    @Override public void onServiceResolved(NsdServiceInfo resolved) {
+                        synchronized (resolving) { resolving[0] = false; }
+                        String address = resolved.getHost() == null ? null : resolved.getHost().getHostAddress();
+                        if (resolved.getPort() != MacBridgeClient.PORT || !MacBridgeClient.isSupportedHost(address)) return;
+                        synchronized (found) {
+                            found.put(resolved.getServiceName() + " · " + address, address);
+                        }
+                    }
+                    });
+                } catch (RuntimeException ignored) {
+                    synchronized (resolving) { resolving[0] = false; }
+                }
+            }
+
+            @Override public void onServiceLost(NsdServiceInfo service) { }
+            @Override public void onDiscoveryStopped(String serviceType) { }
+            @Override public void onStartDiscoveryFailed(String serviceType, int errorCode) {
+                if (finishHolder[0] != null) handler.post(finishHolder[0]);
+            }
+            @Override public void onStopDiscoveryFailed(String serviceType, int errorCode) { }
+        };
+        listenerHolder[0] = listener;
+        finishHolder[0] = () -> {
+            if (finished[0]) return;
+            finished[0] = true;
+            try {
+                manager.stopServiceDiscovery(listenerHolder[0]);
+            } catch (IllegalArgumentException ignored) { }
+            if (multicastLock.isHeld()) multicastLock.release();
+            button.setEnabled(true);
+            ArrayList<String> labels;
+            ArrayList<String> addresses;
+            synchronized (found) {
+                labels = new ArrayList<>(found.keySet());
+                addresses = new ArrayList<>(found.values());
+            }
+            if (addresses.isEmpty()) {
+                status.setText("Mac을 찾지 못했습니다. 같은 Wi-Fi인지 확인하세요.");
+                return;
+            }
+            new AlertDialog.Builder(this)
+                .setTitle("연결할 Mac 선택")
+                .setItems(labels.toArray(new String[0]), (dialog, which) -> {
+                    hostField.setText(addresses.get(which));
+                    status.setText("Mac 주소를 입력했습니다. QR의 짝 토큰과 TLS 지문도 확인하세요.");
+                })
+                .setNegativeButton("취소", null)
+                .show();
+        };
+        try {
+            manager.discoverServices("_sharestack._tcp.", NsdManager.PROTOCOL_DNS_SD, listener);
+            handler.postDelayed(finishHolder[0], 6000);
+        } catch (RuntimeException exception) {
+            finishHolder[0].run();
+            status.setText("Mac 검색을 시작하지 못했습니다.");
+        }
+    }
+
+    private void runMacTransfer(EditText host, EditText token, EditText certificatePin, TextView status,
+        Button send, Button receive, boolean sending) {
+        String address = host.getText().toString().trim();
+        String secret = token.getText().toString().trim();
+        String pin = certificatePin.getText().toString().trim().toLowerCase(Locale.ROOT);
+        MacBridgeClient.Pairing pairing = new MacBridgeClient.Pairing(address, secret, pin);
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString(MacBridgeClient.HOST, address)
+            .putString(MacBridgeClient.TOKEN, secret)
+            .putString(MacBridgeClient.TLS_PIN, pin)
+            .apply();
+        ArrayList<StackItem> selectedItems = new ArrayList<>();
+        if (sending) selectedItems.addAll(selected());
+        if (sending && selectedItems.isEmpty()) {
+            status.setText("먼저 보낼 항목을 선택하세요.");
+            return;
+        }
+        send.setEnabled(false);
+        receive.setEnabled(false);
+        status.setText(sending ? "Mac으로 전송 중…" : "Mac에서 항목 확인 중…");
+        Thread worker = new Thread(() -> {
+            try {
+                int count = sending
+                    ? MacBridgeClient.send(this, pairing, selectedItems)
+                    : MacBridgeClient.receive(this, pairing);
+                runOnUiThread(() -> {
+                    send.setEnabled(true);
+                    receive.setEnabled(true);
+                    status.setText(sending
+                        ? count + "개 항목을 Mac으로 보냈습니다."
+                        : count == 0 ? "받을 항목이 없습니다." : count + "개 항목을 Mac에서 받았습니다.");
+                    if (!sending && count > 0) reloadItems();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> {
+                    send.setEnabled(true);
+                    receive.setEnabled(true);
+                    status.setText(exception.getMessage() == null ? "전송에 실패했습니다." : exception.getMessage());
+                });
+            }
+        }, "share-stack-mac-transfer");
+        worker.start();
     }
 
     private void showSettings() {

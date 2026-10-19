@@ -10,6 +10,10 @@
 		A10000000000000000000005 = {isa = PBXBuildFile; fileRef = A10000000000000000000015; };
 		A10000000000000000000006 = {isa = PBXBuildFile; fileRef = A10000000000000000000016; };
 		A10000000000000000000007 = {isa = PBXBuildFile; fileRef = A10000000000000000000017; };
+		A10000000000000000000008 = {isa = PBXBuildFile; fileRef = A10000000000000000000018; };
+		A10000000000000000000009 = {isa = PBXBuildFile; fileRef = A10000000000000000000019; };
+		A1000000000000000000000A = {isa = PBXBuildFile; fileRef = A1000000000000000000001A; };
+		A1000000000000000000000B = {isa = PBXBuildFile; fileRef = A1000000000000000000001B; };
 		A10000000000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareStackMacApp.swift; sourceTree = "<group>"; };
 		A10000000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransferStore.swift; sourceTree = "<group>"; };
 		A10000000000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkIdentity.swift; sourceTree = "<group>"; };
@@ -17,10 +21,14 @@
 		A10000000000000000000015 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TLSIdentity.swift; sourceTree = "<group>"; };
 		A10000000000000000000016 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiptViews.swift; sourceTree = "<group>"; };
 		A10000000000000000000017 = {isa = PBXFileReference; lastKnownFileType = image.icns; path = Resources/AppIcon.icns; sourceTree = "<group>"; };
+		A10000000000000000000018 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GUIBridge.swift; sourceTree = "<group>"; };
+		A10000000000000000000019 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPServer.swift; sourceTree = "<group>"; };
+		A1000000000000000000001A = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransferJobs.swift; sourceTree = "<group>"; };
+		A1000000000000000000001B = {isa = PBXFileReference; lastKnownFileType = text.json; path = Resources/linkdeck.json; sourceTree = "<group>"; };
 		A10000000000000000000021 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = ShareStackMac.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000031 = {
 			isa = PBXGroup;
-			children = (A10000000000000000000041, A10000000000000000000017, A10000000000000000000021, );
+			children = (A10000000000000000000041, A10000000000000000000017, A1000000000000000000001B, A10000000000000000000021, );
 			sourceTree = "<group>";
 		};
 		A10000000000000000000041 = {
@@ -32,6 +40,9 @@
 				A10000000000000000000014,
 				A10000000000000000000015,
 				A10000000000000000000016,
+				A10000000000000000000018,
+				A10000000000000000000019,
+				A1000000000000000000001A,
 			);
 			path = Sources/ShareStackMac;
 			sourceTree = "<group>";
@@ -46,11 +57,14 @@
 				A10000000000000000000004,
 				A10000000000000000000005,
 				A10000000000000000000006,
+				A10000000000000000000008,
+				A10000000000000000000009,
+				A1000000000000000000000A,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A10000000000000000000061 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
-		A10000000000000000000062 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000007, ); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000062 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000007, A1000000000000000000000B, ); runOnlyForDeploymentPostprocessing = 0; };
 		A10000000000000000000071 = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = A10000000000000000000091;

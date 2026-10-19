@@ -109,4 +109,4 @@ print(request("GET", "/v1/inbox"))
 
 오류 응답은 `{"error":"설명"}`입니다. HTTP 400은 입력 오류, 401은 토큰 불일치, 404는 없는 항목·경로, 409는 상태 충돌·저장 실패·이벤트 커서 만료입니다. 보관함 수신과 취소에는 목록에서 받은 UUID를 사용합니다.
 
-[OpenAPI 명세](openapi.yaml)
+[OpenAPI 명세](openapi.yaml). LinkDeck용 MCP stdio 도구 및 GUI 작업 API는 [LinkDeck 연결 문서](linkdeck.md)를 참고하세요. 이벤트에는 송신 대기 취소를 나타내는 `outbox.cancelled`도 포함됩니다.

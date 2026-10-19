@@ -130,7 +130,7 @@ paths:
                       required: [sequence, type, itemID, createdAt]
                       properties:
                         sequence: {type: integer}
-                        type: {type: string, enum: [file.received, file.saved, file.cancelled, file.save_failed]}
+                        type: {type: string, enum: [file.received, file.saved, file.cancelled, file.save_failed, outbox.cancelled]}
                         itemID: {type: string}
                         createdAt: {type: number, description: Seconds since 2001-01-01 UTC.}
                         error: {type: string}

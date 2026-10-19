@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import LocalAuthentication
 import Security
 
 enum NetworkIdentity {
@@ -85,25 +86,34 @@ enum NetworkIdentity {
         try storedSecret(account: "pairing-token")
     }
 
+    static func existingBearerToken() throws -> String {
+        try storedSecret(account: "pairing-token", create: false)
+    }
+
     static func tlsArchivePassword() throws -> String {
         try storedSecret(account: "tls-archive-password")
     }
 
-    private static func storedSecret(account: String) throws -> String {
+    private static func storedSecret(account: String, create: Bool = true) throws -> String {
         let service = "com.pdg.sharestack.mac.bridge"
-        let query: [String: Any] = [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
+        if !create {
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            query[kSecUseAuthenticationContext as String] = context
+        }
         var value: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &value)
         if status == errSecSuccess, let data = value as? Data {
             return data.base64URLEncodedString()
         }
-        guard status == errSecItemNotFound else { throw IdentityError.keychain(status) }
+        guard status == errSecItemNotFound, create else { throw IdentityError.keychain(status) }
 
         var bytes = [UInt8](repeating: 0, count: 32)
         let randomStatus = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)

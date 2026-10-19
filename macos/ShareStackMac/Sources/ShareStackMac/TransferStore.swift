@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-struct TransferItem: Codable, Identifiable {
+struct TransferItem: Codable, Identifiable, Sendable {
     let id: String
     let name: String
     let mimeType: String
@@ -407,6 +407,19 @@ final class TransferStore: @unchecked Sendable {
         guard let index = items.firstIndex(where: { $0.id == id && Self.isAwaitingAcceptance($0) }) else {
             throw StoreError.itemNotInInbox
         }
+        try removeItemLocked(at: index, eventType: "file.cancelled")
+    }
+
+    func cancelOutgoingItem(_ id: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let index = items.firstIndex(where: { $0.id == id && $0.origin == "mac" && $0.state == "pending" }) else {
+            throw StoreError.itemNotPending
+        }
+        try removeItemLocked(at: index, eventType: "outbox.cancelled")
+    }
+
+    private func removeItemLocked(at index: Int, eventType: String) throws {
         let item = items[index]
         let source = storedURL(item)
         let discarded = temporaryURL.appendingPathComponent(UUID().uuidString)
@@ -430,7 +443,7 @@ final class TransferStore: @unchecked Sendable {
                 throw error
             }
         }
-        recordEventLocked("file.cancelled", itemID: id)
+        recordEventLocked(eventType, itemID: item.id)
     }
 
     private static func isAwaitingAcceptance(_ item: TransferItem) -> Bool {
@@ -461,6 +474,21 @@ final class TransferStore: @unchecked Sendable {
             try fileManager.removeItem(at: temporary)
             try fileManager.copyItem(at: source, to: temporary)
             return try enqueueTemporaryFile(temporary, name: source.lastPathComponent, mimeType: mimeType)
+        } catch {
+            try? fileManager.removeItem(at: temporary)
+            throw error
+        }
+    }
+
+    func importReceivedFile(_ source: URL, mimeType: String) throws -> TransferItem {
+        let temporary = try makeTemporaryFile()
+        let accessed = source.startAccessingSecurityScopedResource()
+        defer { if accessed { source.stopAccessingSecurityScopedResource() } }
+        do {
+            try fileManager.removeItem(at: temporary)
+            try fileManager.copyItem(at: source, to: temporary)
+            let checksum = try Self.sha256(temporary)
+            return try saveReceivedFile(temporary, name: source.lastPathComponent, mimeType: mimeType, expectedSHA256: checksum)
         } catch {
             try? fileManager.removeItem(at: temporary)
             throw error
@@ -610,6 +638,7 @@ final class TransferStore: @unchecked Sendable {
         case invalidSaveFolder
         case itemNotInInbox
         case eventCursorExpired
+        case itemNotPending
 
         var errorDescription: String? {
             switch self {
@@ -622,6 +651,7 @@ final class TransferStore: @unchecked Sendable {
             case .invalidSaveFolder: return "앱 데이터 폴더 밖의 저장 폴더를 선택하세요"
             case .itemNotInInbox: return "보관함에서 수신 대기 중인 파일이 아닙니다"
             case .eventCursorExpired: return "이벤트 커서가 만료되었습니다. 커서 없이 다시 조회하세요"
+            case .itemNotPending: return "휴대전화 전송 대기 중인 파일이 아닙니다"
             }
         }
     }

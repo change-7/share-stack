@@ -5,6 +5,16 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 @main
+enum ShareStackEntry {
+    @MainActor static func main() {
+        if CommandLine.arguments.contains("--mcp") {
+            MCPServer().run()
+        } else {
+            ShareStackMacApp.main()
+        }
+    }
+}
+
 struct ShareStackMacApp: App {
     @NSApplicationDelegateAdaptor(MenuBarController.self) private var menuBarController
 
@@ -31,6 +41,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
             openSettings: { [weak self] in self?.showSettings() }
         ))
         hostingController.sizingOptions = []
+        hostingController.view.focusRingType = .none
         popover.contentViewController = hostingController
         popover.contentSize = NSSize(width: 360, height: 460)
         popover.behavior = .applicationDefined
@@ -134,7 +145,6 @@ final class MacAppModel: ObservableObject {
     @Published var addresses: [String] = []
     @Published var token = ""
     @Published var certificateFingerprint = ""
-    @Published var recentItems: [TransferItem] = []
     @Published var inboxItems: [TransferItem] = []
     @Published var receiptSettings = ReceiptSettings()
     @Published var receiptMessage = ""
@@ -178,7 +188,8 @@ final class MacAppModel: ObservableObject {
             refresh()
             let token = try NetworkIdentity.bearerToken()
             let tlsIdentity = try TLSIdentity()
-            let server = TransferHTTPServer(store: store, token: token, tlsIdentity: tlsIdentity)
+            let server = try TransferHTTPServer(store: store, token: token, tlsIdentity: tlsIdentity)
+            try GUIBridge.publish(fingerprint: tlsIdentity.certificateFingerprint)
             self.server = server
             self.token = token
             self.certificateFingerprint = tlsIdentity.certificateFingerprint
@@ -197,7 +208,6 @@ final class MacAppModel: ObservableObject {
 
     func refresh() {
         addresses = NetworkIdentity.localIPv4Addresses() + NetworkIdentity.tailscaleIPv4Addresses()
-        recentItems = store?.recentItems() ?? []
         inboxItems = store?.inboxItems() ?? []
     }
 
@@ -362,13 +372,13 @@ private struct ShareStackMenu: View {
                 .help("설정")
                 .accessibilityLabel("설정")
             }
-            Picker("표시할 정보", selection: $model.menuSection) {
+            Picker("메뉴", selection: $model.menuSection) {
                 Text("보관함").tag(0)
-                Text("QR").tag(1)
+                Text("연결").tag(1)
                 Text("연결 정보").tag(2)
-                Text("기록").tag(3)
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
 
                 VStack(alignment: .leading, spacing: 12) {
                     if model.menuSection == 0 {
@@ -428,33 +438,6 @@ private struct ShareStackMenu: View {
                                 .background(StackDesign.card, in: RoundedRectangle(cornerRadius: 14))
                     }
 
-                    if model.menuSection == 3 {
-                        VStack(alignment: .leading, spacing: 8) {
-                            if model.recentItems.isEmpty {
-                                Text("기록 없음").foregroundStyle(.secondary)
-                            } else {
-                                ForEach(Array(model.recentItems.prefix(3))) { item in
-                                    HStack(spacing: 10) {
-                                        Image(systemName: StackDesign.fileSymbol(item.mimeType))
-                                            .foregroundStyle(StackDesign.accent)
-                                            .frame(width: 26)
-                                        VStack(alignment: .leading, spacing: 3) {
-                                        Text(item.name).lineLimit(1)
-                                        Text(item.origin == "mac" ? (item.state == "delivered" ? "전송 완료" : "전송 대기") : (item.state == "saved" ? "저장 완료" : "수신 대기"))
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                        }
-                                        Spacer(minLength: 0)
-                                    }
-                                    .padding(10)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(StackDesign.card, in: RoundedRectangle(cornerRadius: 12))
-                                }
-                            }
-                        }
-                        .font(.caption)
-                        .padding(.top, 6)
-                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             .frame(maxHeight: .infinity, alignment: .top)
@@ -485,6 +468,7 @@ private struct ShareStackMenu: View {
         }
         .padding(16)
         .frame(width: 360, height: 460)
+        .modifier(HiddenFocusRing())
         .background(.regularMaterial)
         .tint(StackDesign.accent)
         .onAppear { model.refresh() }

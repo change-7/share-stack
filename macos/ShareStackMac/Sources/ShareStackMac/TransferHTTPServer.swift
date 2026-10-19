@@ -10,15 +10,19 @@ final class TransferHTTPServer {
     private let store: TransferStore
     private let token: String
     private let tlsIdentity: TLSIdentity
+    private let jobs: TransferJobs
     private let queue = DispatchQueue(label: "com.pdg.sharestack.mac.transfer-server")
     private var listener: NWListener?
     var statusHandler: ((String) -> Void)?
-    var itemsChangedHandler: (() -> Void)?
+    var itemsChangedHandler: (() -> Void)? {
+        didSet { jobs.setChangeHandler(itemsChangedHandler) }
+    }
 
-    init(store: TransferStore, token: String, tlsIdentity: TLSIdentity) {
+    init(store: TransferStore, token: String, tlsIdentity: TLSIdentity) throws {
         self.store = store
         self.token = token
         self.tlsIdentity = tlsIdentity
+        self.jobs = try TransferJobs(store: store)
     }
 
     func start() throws {
@@ -100,7 +104,18 @@ final class TransferHTTPServer {
         }
 
         let path = request.target.split(separator: "?", maxSplits: 1).first.map(String.init) ?? request.target
+        if routeJobs(connection, request: request, path: path, initialBody: initialBody) { return }
         if routeControl(connection, request: request, path: path, initialBody: initialBody) { return }
+        let itemParts = path.split(separator: "/")
+        if request.method == "GET", itemParts.count == 3, itemParts[0] == "v1", itemParts[1] == "items",
+           UUID(uuidString: String(itemParts[2])) != nil {
+            if let item = store.item(for: String(itemParts[2]).lowercased()) {
+                sendJSON(connection, status: 200, value: item)
+            } else {
+                sendError(connection, status: 404, message: "Item not found")
+            }
+            return
+        }
         if request.method == "GET", path == "/v1/health" {
             sendJSON(connection, status: 200, value: ["status": "ok"])
             return
@@ -240,6 +255,61 @@ final class TransferHTTPServer {
             return
         }
         sendError(connection, status: 404, message: "Not found")
+    }
+
+    private func routeJobs(_ connection: NWConnection, request: HTTPRequest, path: String, initialBody: Data) -> Bool {
+        guard path == "/v1/jobs" || path.hasPrefix("/v1/jobs/") else { return false }
+        guard let endpoint = connection.currentPath?.remoteEndpoint,
+              case .hostPort(let host, _) = endpoint,
+              ["127.0.0.1", "::1"].contains(String(describing: host)) else {
+            sendError(connection, status: 403, message: "Job control is available only on this Mac")
+            return true
+        }
+        if request.method == "POST", path == "/v1/jobs" {
+            guard request.contentLength > 0, request.contentLength <= 1024 * 1024,
+                  request.headers["content-type"]?.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased() == "application/json" else {
+                sendError(connection, status: 400, message: "Expected job JSON up to 1 MiB")
+                return true
+            }
+            receiveBodyData(connection, expectedLength: request.contentLength, accumulated: initialBody) { [weak self] data in
+                guard let self else { return }
+                do {
+                    guard let data else { throw JobError.invalidInput }
+                    let request = try JSONDecoder().decode(TransferJobRequest.self, from: data)
+                    self.sendJSON(connection, status: 201, value: try self.jobs.submit(request))
+                } catch {
+                    self.sendError(connection, status: 400, message: error.localizedDescription)
+                }
+            }
+            return true
+        }
+        guard request.contentLength == 0, initialBody.isEmpty else {
+            sendError(connection, status: 400, message: "Unexpected request body")
+            return true
+        }
+        let parts = path.split(separator: "/")
+        do {
+            if request.method == "GET", path == "/v1/jobs" {
+                let query = URLComponents(string: request.target)?.queryItems ?? []
+                guard Set(query.map(\.name)).count == query.count,
+                      let limit = Int(query.first(where: { $0.name == "limit" })?.value ?? "50"), (1...100).contains(limit),
+                      let offset = Int(query.first(where: { $0.name == "offset" })?.value ?? "0"), offset >= 0 else { throw JobError.invalidInput }
+                sendJSON(connection, status: 200, value: jobs.list(limit: limit, offset: offset))
+            } else if parts.count == 3, request.method == "GET", UUID(uuidString: String(parts[2])) != nil {
+                sendJSON(connection, status: 200, value: try jobs.get(String(parts[2]).lowercased()))
+            } else if parts.count == 4, request.method == "POST", parts[3] == "cancel", UUID(uuidString: String(parts[2])) != nil {
+                sendJSON(connection, status: 200, value: try jobs.cancel(String(parts[2]).lowercased()))
+            } else {
+                sendError(connection, status: 404, message: "Unknown job operation")
+            }
+        } catch JobError.invalidInput {
+            sendError(connection, status: 400, message: "Invalid job input")
+        } catch JobError.notFound {
+            sendError(connection, status: 404, message: "Job not found")
+        } catch {
+            sendError(connection, status: 500, message: error.localizedDescription)
+        }
+        return true
     }
 
     private struct ControlStatus: Encodable {
@@ -544,6 +614,7 @@ final class TransferHTTPServer {
         switch status {
         case 400: reason = "Bad Request"
         case 401: reason = "Unauthorized"
+        case 403: reason = "Forbidden"
         case 404: reason = "Not Found"
         case 413: reason = "Payload Too Large"
         case 416: reason = "Range Not Satisfiable"

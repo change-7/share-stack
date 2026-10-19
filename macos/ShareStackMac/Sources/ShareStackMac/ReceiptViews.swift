@@ -1,5 +1,15 @@
 import SwiftUI
 
+struct HiddenFocusRing: ViewModifier {
+    @ViewBuilder func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) {
+            content.focusEffectDisabled()
+        } else {
+            content
+        }
+    }
+}
+
 enum StackDesign {
     static let accent = Color.teal
     static let card = Color.primary.opacity(0.045)
@@ -75,6 +85,7 @@ struct ReceiptSettingsView: View {
         }
         .padding(20)
         .frame(width: 460, height: 360)
+        .modifier(HiddenFocusRing())
         .background(.regularMaterial)
         .tint(StackDesign.accent)
     }

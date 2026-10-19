@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "share_stack",
+  "name": "Share Stack",
+  "transport": "mcp_stdio",
+  "arguments": ["--mcp"],
+  "tools": [
+    "get_status",
+    "list_inbox",
+    "get_item",
+    "list_history",
+    "list_outbox",
+    "list_events",
+    "receive_files",
+    "receive_all",
+    "cancel_inbox_files",
+    "cancel_outbox_files",
+    "send_text",
+    "send_files",
+    "add_inbox_files",
+    "get_job",
+    "list_jobs",
+    "cancel_job"
+  ]
+}

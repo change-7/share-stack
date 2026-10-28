@@ -1,28 +1,50 @@
 import Foundation
 import Network
+import UniformTypeIdentifiers
 
 final class TransferHTTPServer {
     static let port: UInt16 = 8765
     private static let maximumHeaderSize = 16 * 1024
-    private static let maximumChunkSize = 4 * 1024 * 1024
+    private static let maximumChunkSize = 8 * 1024 * 1024
     fileprivate static let maximumUploadSize = TransferStore.maximumItemSize
+    private static let transferBufferSize = 256 * 1024
+    private static let maximumConnections = 32
+    /// 클라이언트가 끊긴 채 남은 연결이 슬롯을 계속 차지하지 않도록 하는 무응답 한도.
+    private static let idleTimeout: TimeInterval = 120
+    private static let idleSweepInterval: TimeInterval = 15
 
     private let store: TransferStore
     private let token: String
+    private let aiToken: String
     private let tlsIdentity: TLSIdentity
     private let jobs: TransferJobs
-    private let queue = DispatchQueue(label: "com.pdg.sharestack.mac.transfer-server")
+    private let queue = DispatchQueue(label: "com.pdg.sharestack.mac.transfer-server", autoreleaseFrequency: .workItem)
+    private let workQueue = DispatchQueue(label: "com.pdg.sharestack.mac.transfer-work", qos: .userInitiated,
+                                          attributes: .concurrent, autoreleaseFrequency: .workItem)
+    private let uploadQueue = DispatchQueue(label: "com.pdg.sharestack.mac.transfer-upload", qos: .userInitiated,
+                                             autoreleaseFrequency: .workItem)
     private var listener: NWListener?
+    private var connections: [ObjectIdentifier: ConnectionEntry] = [:]
+    private var idleTimer: DispatchSourceTimer?
+    private let aiJobLock = NSLock()
+    private var aiJobIDs = Set<String>()
     var statusHandler: ((String) -> Void)?
     var itemsChangedHandler: (() -> Void)? {
         didSet { jobs.setChangeHandler(itemsChangedHandler) }
     }
 
-    init(store: TransferStore, token: String, tlsIdentity: TLSIdentity) throws {
+    private struct ConnectionEntry {
+        let connection: NWConnection
+        var lastActivity: Date
+        var isProcessing = false
+    }
+
+    init(store: TransferStore, token: String, aiToken: String, tlsIdentity: TLSIdentity) throws {
         self.store = store
         self.token = token
+        self.aiToken = aiToken
         self.tlsIdentity = tlsIdentity
-        self.jobs = try TransferJobs(store: store)
+        self.jobs = TransferJobs(store: store)
     }
 
     func start() throws {
@@ -48,11 +70,60 @@ final class TransferHTTPServer {
             self?.accept(connection)
         }
         self.listener = listener
+        startIdleSweeper()
         listener.start(queue: queue)
     }
 
+    private func startIdleSweeper() {
+        guard idleTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.idleSweepInterval, repeating: Self.idleSweepInterval)
+        timer.setEventHandler { [weak self] in self?.closeIdleConnections() }
+        timer.resume()
+        idleTimer = timer
+    }
+
+    private func closeIdleConnections() {
+        let deadline = Date().addingTimeInterval(-Self.idleTimeout)
+        let expired = connections
+            .filter { !$0.value.isProcessing && $0.value.lastActivity < deadline }
+            .map(\.key)
+        for identifier in expired {
+            guard let entry = connections.removeValue(forKey: identifier) else { continue }
+            entry.connection.cancel()
+        }
+    }
+
+    /// 네트워크에서 데이터를 주고받을 때마다 호출한다. (queue에서만 호출)
+    private func touch(_ connection: NWConnection) {
+        connections[ObjectIdentifier(connection)]?.lastActivity = Date()
+    }
+
+    /// 해시·검증처럼 응답 없이 오래 걸리는 작업 중에는 무응답 정리를 건너뛴다.
+    private func beginProcessing(_ connection: NWConnection) {
+        queue.async { [weak self] in
+            guard let self, var entry = self.connections[ObjectIdentifier(connection)] else { return }
+            entry.isProcessing = true
+            entry.lastActivity = Date()
+            self.connections[ObjectIdentifier(connection)] = entry
+        }
+    }
+
+    private func endProcessing(_ connection: NWConnection) {
+        queue.async { [weak self] in
+            guard let self, var entry = self.connections[ObjectIdentifier(connection)] else { return }
+            entry.isProcessing = false
+            entry.lastActivity = Date()
+            self.connections[ObjectIdentifier(connection)] = entry
+        }
+    }
+
     private func accept(_ connection: NWConnection) {
-        connection.stateUpdateHandler = { [weak self] state in
+        guard connections.count < Self.maximumConnections else { connection.cancel(); return }
+        let identifier = ObjectIdentifier(connection)
+        connections[identifier] = ConnectionEntry(connection: connection, lastActivity: Date())
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let connection else { return }
             switch state {
             case .ready:
                 guard let endpoint = connection.currentPath?.remoteEndpoint,
@@ -62,6 +133,8 @@ final class TransferHTTPServer {
                 }
                 self?.receiveHeaders(connection, accumulated: Data())
             case .failed, .cancelled:
+                self?.connections.removeValue(forKey: identifier)
+                connection.stateUpdateHandler = nil
                 connection.cancel()
             default:
                 break
@@ -76,6 +149,7 @@ final class TransferHTTPServer {
                 connection.cancel()
                 return
             }
+            self.touch(connection)
             var bytes = accumulated
             bytes.append(data)
             let separator = Data([13, 10, 13, 10])
@@ -98,13 +172,22 @@ final class TransferHTTPServer {
     }
 
     private func route(_ connection: NWConnection, request: HTTPRequest, initialBody: Data) {
-        guard let authorization = request.headers["authorization"], Self.matchesBearer(authorization, token: token) else {
+        guard let caller = Self.caller(for: request.headers["authorization"], phoneToken: token, aiToken: aiToken) else {
             sendError(connection, status: 401, message: "Unauthorized")
             return
         }
-
+        if caller == .aiMCP && !Self.isLoopback(connection.currentPath?.remoteEndpoint) {
+            sendError(connection, status: 403, message: "Operation is not available to this caller")
+            return
+        }
         let path = request.target.split(separator: "?", maxSplits: 1).first.map(String.init) ?? request.target
-        if routeJobs(connection, request: request, path: path, initialBody: initialBody) { return }
+        guard Self.mayAccess(path, caller: caller) else {
+            sendError(connection, status: 403, message: "Operation is not available to this caller")
+            return
+        }
+        if routeExchangeText(connection, request: request, path: path, initialBody: initialBody, caller: caller) { return }
+        if routeSharedFiles(connection, request: request, path: path, caller: caller) { return }
+        if routeJobs(connection, request: request, path: path, initialBody: initialBody, caller: caller) { return }
         if routeControl(connection, request: request, path: path, initialBody: initialBody) { return }
         let itemParts = path.split(separator: "/")
         if request.method == "GET", itemParts.count == 3, itemParts[0] == "v1", itemParts[1] == "items",
@@ -139,13 +222,15 @@ final class TransferHTTPServer {
                 sendError(connection, status: 400, message: "Missing item metadata")
                 return
             }
+            var temporary: URL?
             do {
-                let temporary = try store.makeTemporaryFile()
-                let handle = try FileHandle(forWritingTo: temporary)
+                let file = try store.makeTemporaryFile()
+                temporary = file
+                let handle = try FileHandle(forWritingTo: file)
                 receiveBody(
                     connection,
                     request: request,
-                    temporary: temporary,
+                    temporary: file,
                     handle: handle,
                     name: name,
                     mimeType: mimeType,
@@ -154,7 +239,9 @@ final class TransferHTTPServer {
                     initialBody: initialBody,
                     written: 0
                 )
+                temporary = nil
             } catch {
+                if let temporary { try? FileManager.default.removeItem(at: temporary) }
                 sendError(connection, status: 500, message: "Cannot prepare upload")
             }
             return
@@ -195,11 +282,13 @@ final class TransferHTTPServer {
                     self?.sendError(connection, status: 400, message: "Incomplete upload chunk")
                     return
                 }
-                do {
-                    let status = try self.store.appendUploadChunk(id, range: range, data: data)
-                    self.sendJSON(connection, status: 200, value: status)
-                } catch {
-                    self.sendError(connection, status: 409, message: error.localizedDescription)
+                self.uploadQueue.async {
+                    do {
+                        let status = try self.store.appendUploadChunk(id, range: range, data: data)
+                        self.sendJSON(connection, status: 200, value: status)
+                    } catch {
+                        self.sendError(connection, status: 409, message: error.localizedDescription)
+                    }
                 }
             }
             return
@@ -210,12 +299,17 @@ final class TransferHTTPServer {
                 return
             }
             let id = String(path.dropFirst("/v1/uploads/".count).dropLast("/finish".count))
-            do {
-                let item = try store.finishUpload(id)
-                received(item)
-                sendJSON(connection, status: 201, value: item)
-            } catch {
-                sendError(connection, status: 409, message: error.localizedDescription)
+            workQueue.async { [weak self] in
+                guard let self else { return }
+                self.beginProcessing(connection)
+                do {
+                    let item = try self.store.finishUpload(id)
+                    self.received(item)
+                    self.sendJSON(connection, status: 201, value: item)
+                } catch {
+                    self.sendError(connection, status: 409, message: error.localizedDescription)
+                }
+                self.endProcessing(connection)
             }
             return
         }
@@ -257,7 +351,69 @@ final class TransferHTTPServer {
         sendError(connection, status: 404, message: "Not found")
     }
 
-    private func routeJobs(_ connection: NWConnection, request: HTTPRequest, path: String, initialBody: Data) -> Bool {
+    private func routeSharedFiles(_ connection: NWConnection, request: HTTPRequest, path: String, caller: Caller) -> Bool {
+        guard path == "/v1/shared-files" || path.hasPrefix("/v1/shared-files/") else { return false }
+        guard caller == .aiMCP else {
+            sendError(connection, status: 403, message: "Operation is not available to this caller")
+            return true
+        }
+        guard request.method == "GET", request.contentLength == 0 else {
+            sendError(connection, status: 400, message: "Shared file endpoints accept GET without a body")
+            return true
+        }
+        let query = URLComponents(string: request.target)?.queryItems ?? []
+        func number(_ name: String, default value: Int) -> Int? {
+            guard let raw = query.first(where: { $0.name == name })?.value else { return value }
+            return Int(raw)
+        }
+        if path == "/v1/shared-files" {
+            guard let offset = number("offset", default: 0), (0...1_000_000).contains(offset),
+                  let limit = number("limit", default: 50), (1...100).contains(limit) else {
+                sendError(connection, status: 400, message: "Invalid shared file page")
+                return true
+            }
+            do { sendJSON(connection, status: 200, value: try store.aiSharedFiles(offset: offset, limit: limit)) }
+            catch { sendError(connection, status: 403, message: "AI Exchange reading is unavailable") }
+            return true
+        }
+        let parts = path.split(separator: "/").map(String.init)
+        guard parts.count == 3 || parts.count == 4, UUID(uuidString: parts[2]) != nil else {
+            sendError(connection, status: 404, message: "Shared file not found")
+            return true
+        }
+        let id = parts[2].lowercased()
+        do {
+            if parts.count == 3 {
+                sendJSON(connection, status: 200, value: try store.aiSharedFileInfo(id))
+            } else if parts[3] == "content" {
+                guard let offset = number("offset", default: 0), let limit = number("limit", default: 4096) else {
+                    sendError(connection, status: 400, message: "Invalid shared file range")
+                    return true
+                }
+                sendJSON(connection, status: 200, value: try store.readAIExchangeFile(id, offset: Int64(offset), limit: limit))
+            } else {
+                sendError(connection, status: 404, message: "Shared file not found")
+            }
+        } catch let error as TransferStore.StoreError {
+            let status: Int
+            switch error {
+            case .sharedFileNotFound: status = 404
+            case .unsupportedSharedFile: status = 415
+            case .invalidSharedFileRange: status = 416
+            case .invalidSharedFileEncoding: status = 422
+            case .sharedFileUnavailable, .checksumMismatch, .exchangeUnavailable: status = 409
+            case .aiExchangeDisabled: status = 403
+            default: status = 500
+            }
+            sendError(connection, status: status, message: "AI Exchange file is unavailable")
+        } catch {
+            sendError(connection, status: 500, message: "Cannot read shared file")
+        }
+        return true
+    }
+
+    private func routeJobs(_ connection: NWConnection, request: HTTPRequest, path: String, initialBody: Data,
+                           caller: Caller) -> Bool {
         guard path == "/v1/jobs" || path.hasPrefix("/v1/jobs/") else { return false }
         guard let endpoint = connection.currentPath?.remoteEndpoint,
               case .hostPort(let host, _) = endpoint,
@@ -276,7 +432,17 @@ final class TransferHTTPServer {
                 do {
                     guard let data else { throw JobError.invalidInput }
                     let request = try JSONDecoder().decode(TransferJobRequest.self, from: data)
-                    self.sendJSON(connection, status: 201, value: try self.jobs.submit(request))
+                    if caller == .aiMCP && !Self.maySubmitAIJob(request.operation) {
+                        self.sendError(connection, status: 403, message: "Operation is not available to this caller")
+                        return
+                    }
+                    let job = try self.jobs.submit(request)
+                    if caller == .aiMCP {
+                        self.aiJobLock.lock()
+                        self.aiJobIDs.insert(job.id)
+                        self.aiJobLock.unlock()
+                    }
+                    self.sendJSON(connection, status: 201, value: job)
                 } catch {
                     self.sendError(connection, status: 400, message: error.localizedDescription)
                 }
@@ -289,16 +455,14 @@ final class TransferHTTPServer {
         }
         let parts = path.split(separator: "/")
         do {
-            if request.method == "GET", path == "/v1/jobs" {
-                let query = URLComponents(string: request.target)?.queryItems ?? []
-                guard Set(query.map(\.name)).count == query.count,
-                      let limit = Int(query.first(where: { $0.name == "limit" })?.value ?? "50"), (1...100).contains(limit),
-                      let offset = Int(query.first(where: { $0.name == "offset" })?.value ?? "0"), offset >= 0 else { throw JobError.invalidInput }
-                sendJSON(connection, status: 200, value: jobs.list(limit: limit, offset: offset))
-            } else if parts.count == 3, request.method == "GET", UUID(uuidString: String(parts[2])) != nil {
-                sendJSON(connection, status: 200, value: try jobs.get(String(parts[2]).lowercased()))
+            if parts.count == 3, request.method == "GET", UUID(uuidString: String(parts[2])) != nil {
+                let id = String(parts[2]).lowercased()
+                guard caller != .aiMCP || isAIJob(id) else { throw JobError.notFound }
+                sendJSON(connection, status: 200, value: try jobs.get(id))
             } else if parts.count == 4, request.method == "POST", parts[3] == "cancel", UUID(uuidString: String(parts[2])) != nil {
-                sendJSON(connection, status: 200, value: try jobs.cancel(String(parts[2]).lowercased()))
+                let id = String(parts[2]).lowercased()
+                guard caller != .aiMCP || isAIJob(id) else { throw JobError.notFound }
+                sendJSON(connection, status: 200, value: try jobs.cancel(id))
             } else {
                 sendError(connection, status: 404, message: "Unknown job operation")
             }
@@ -308,6 +472,81 @@ final class TransferHTTPServer {
             sendError(connection, status: 404, message: "Job not found")
         } catch {
             sendError(connection, status: 500, message: error.localizedDescription)
+        }
+        return true
+    }
+
+    private func isAIJob(_ id: String) -> Bool {
+        aiJobLock.lock()
+        defer { aiJobLock.unlock() }
+        return aiJobIDs.contains(id)
+    }
+
+    enum Caller: Equatable {
+        case phone
+        case aiMCP
+    }
+
+    static func caller(for authorization: String?, phoneToken: String, aiToken: String) -> Caller? {
+        guard let authorization else { return nil }
+        if matchesBearer(authorization, token: aiToken) { return .aiMCP }
+        if matchesBearer(authorization, token: phoneToken) { return .phone }
+        return nil
+    }
+
+    static func mayAccess(_ path: String, caller: Caller) -> Bool {
+        let sharedFiles = path == "/v1/shared-files" || path.hasPrefix("/v1/shared-files/")
+        let jobs = path == "/v1/jobs" || path.hasPrefix("/v1/jobs/")
+        let exchangeText = path == "/v1/ai-exchange/text"
+        switch caller {
+        case .phone: return !sharedFiles && !exchangeText
+        case .aiMCP: return sharedFiles || jobs || exchangeText
+        }
+    }
+
+    static func maySubmitAIJob(_ operation: TransferJobRequest.Operation) -> Bool {
+        operation == .receiveTextFile
+    }
+
+    private static func isLoopback(_ endpoint: NWEndpoint?) -> Bool {
+        guard let endpoint, case .hostPort(let host, _) = endpoint else { return false }
+        return ["127.0.0.1", "::1"].contains(String(describing: host))
+    }
+
+    private struct ExchangeTextSubmission: Decodable {
+        let filename: String
+        let content: String
+    }
+
+    private func routeExchangeText(_ connection: NWConnection, request: HTTPRequest, path: String,
+                                   initialBody: Data, caller: Caller) -> Bool {
+        guard path == "/v1/ai-exchange/text" else { return false }
+        guard caller == .aiMCP else {
+            sendError(connection, status: 403, message: "Operation is not available to this caller")
+            return true
+        }
+        guard request.method == "POST", request.contentLength > 0, request.contentLength <= 1024 * 1024,
+              request.headers["content-type"]?.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased() == "application/json" else {
+            sendError(connection, status: 400, message: "Invalid AI Exchange text request")
+            return true
+        }
+        receiveBodyData(connection, expectedLength: request.contentLength, accumulated: initialBody) { [weak self] data in
+            guard let self else { return }
+            do {
+                guard let data,
+                      let submission = try? JSONDecoder().decode(ExchangeTextSubmission.self, from: data) else {
+                    self.sendError(connection, status: 400, message: "Invalid AI Exchange text request")
+                    return
+                }
+                let ext = URL(fileURLWithPath: submission.filename).pathExtension
+                let mimeType = UTType(filenameExtension: ext)?.preferredMIMEType ?? "text/plain"
+                let file = try self.store.receiveExchangeTextFile(filename: submission.filename,
+                                                                  content: submission.content, mimeType: mimeType)
+                self.itemsChangedHandler?()
+                self.sendJSON(connection, status: 201, value: file)
+            } catch {
+                self.sendError(connection, status: 400, message: "AI Exchange text registration failed")
+            }
         }
         return true
     }
@@ -327,7 +566,7 @@ final class TransferHTTPServer {
     private func routeControl(_ connection: NWConnection, request: HTTPRequest, path: String, initialBody: Data) -> Bool {
         let parts = path.split(separator: "/").map(String.init)
         let isInbox = path == "/v1/inbox" || path.hasPrefix("/v1/inbox/")
-        let isControl = isInbox || ["/v1/status", "/v1/history", "/v1/events", "/v1/outbox/text"].contains(path)
+        let isControl = isInbox || ["/v1/status", "/v1/events", "/v1/outbox/text"].contains(path)
         guard isControl else { return false }
         if path != "/v1/outbox/text", request.contentLength != 0 || !initialBody.isEmpty {
             sendError(connection, status: 400, message: "Unexpected request body")
@@ -347,13 +586,6 @@ final class TransferHTTPServer {
             ))
         } else if request.method == "GET", path == "/v1/inbox" {
             sendJSON(connection, status: 200, value: store.inboxItems())
-        } else if request.method == "GET", path == "/v1/history" {
-            guard let limit = Int(parameters["limit"] ?? "50"), (1...100).contains(limit),
-                  let offset = Int(parameters["offset"] ?? "0"), offset >= 0 else {
-                sendError(connection, status: 400, message: "Invalid limit or offset")
-                return true
-            }
-            sendJSON(connection, status: 200, value: store.recentItems(limit: limit, offset: offset))
         } else if request.method == "GET", path == "/v1/events" {
             if let value = parameters["after"], Int(value).map({ $0 >= 0 }) != true {
                 sendError(connection, status: 400, message: "Invalid event cursor")
@@ -442,26 +674,53 @@ final class TransferHTTPServer {
         accumulated: Data,
         completion: @escaping (Data?) -> Void
     ) {
-        guard Int64(accumulated.count) <= expectedLength else {
+        guard Int64(accumulated.count) <= expectedLength, expectedLength <= Int64(Int.max) else {
             completion(nil)
             return
         }
-        if Int64(accumulated.count) == expectedLength {
-            completion(accumulated)
+        let buffer = BodyBuffer(accumulated, capacity: Int(expectedLength))
+        collectBodyData(connection, expectedLength: expectedLength, buffer: buffer, completion: completion)
+    }
+
+    private final class BodyBuffer {
+        var data: Data
+
+        init(_ initial: Data, capacity: Int) {
+            data = initial
+            data.reserveCapacity(capacity)
+        }
+
+        func append(_ chunk: Data) {
+            data.append(chunk)
+        }
+    }
+
+    private func collectBodyData(
+        _ connection: NWConnection,
+        expectedLength: Int64,
+        buffer: BodyBuffer,
+        completion: @escaping (Data?) -> Void
+    ) {
+        if Int64(buffer.data.count) == expectedLength {
+            completion(buffer.data)
             return
         }
-        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.maximumChunkSize) { [weak self] data, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.transferBufferSize) { [weak self] data, _, isComplete, error in
             guard let self, error == nil, let data, !data.isEmpty else {
                 completion(nil)
                 return
             }
-            var next = accumulated
-            next.append(data)
-            if isComplete && Int64(next.count) < expectedLength {
+            self.touch(connection)
+            buffer.append(data)
+            guard Int64(buffer.data.count) <= expectedLength else {
                 completion(nil)
                 return
             }
-            self.receiveBodyData(connection, expectedLength: expectedLength, accumulated: next, completion: completion)
+            if isComplete && Int64(buffer.data.count) < expectedLength {
+                completion(nil)
+                return
+            }
+            self.collectBodyData(connection, expectedLength: expectedLength, buffer: buffer, completion: completion)
         }
     }
 
@@ -499,30 +758,38 @@ final class TransferHTTPServer {
             return
         }
         if totalWritten == request.contentLength {
-            do {
-                try handle.close()
-                let item: TransferItem
-                if outgoing {
-                    item = try store.enqueueTemporaryFile(temporary, name: name, mimeType: mimeType, expectedSHA256: expectedSHA256)
-                    itemsChangedHandler?()
-                } else {
-                    item = try store.saveReceivedFile(temporary, name: name, mimeType: mimeType, expectedSHA256: expectedSHA256)
-                    received(item)
+            try? handle.close()
+            workQueue.async { [weak self] in
+                guard let self else { return }
+                self.beginProcessing(connection)
+                do {
+                    let item: TransferItem
+                    if outgoing {
+                        item = try self.store.enqueueTemporaryFile(temporary, name: name, mimeType: mimeType,
+                                                                   expectedSHA256: expectedSHA256)
+                        self.itemsChangedHandler?()
+                    } else {
+                        item = try self.store.saveReceivedFile(temporary, name: name, mimeType: mimeType,
+                                                               expectedSHA256: expectedSHA256)
+                        self.received(item)
+                    }
+                    self.sendJSON(connection, status: 201, value: item)
+                } catch {
+                    try? FileManager.default.removeItem(at: temporary)
+                    self.sendError(connection, status: 400, message: error.localizedDescription)
                 }
-                sendJSON(connection, status: 201, value: item)
-            } catch {
-                try? FileManager.default.removeItem(at: temporary)
-                sendError(connection, status: 400, message: error.localizedDescription)
+                self.endProcessing(connection)
             }
             return
         }
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.transferBufferSize) { [weak self] data, _, isComplete, error in
             guard let self, error == nil, let data, !data.isEmpty, !isComplete else {
                 try? handle.close()
                 try? FileManager.default.removeItem(at: temporary)
                 connection.cancel()
                 return
             }
+            self.touch(connection)
             self.receiveBody(
                 connection,
                 request: request,
@@ -559,6 +826,7 @@ final class TransferHTTPServer {
                     connection.cancel()
                     return
                 }
+                self.touch(connection)
                 self.sendNextFileChunk(connection, handle: handle, remaining: length)
             })
         } catch {
@@ -573,7 +841,7 @@ final class TransferHTTPServer {
             return
         }
         do {
-            guard let chunk = try handle.read(upToCount: min(64 * 1024, Int(remaining))), !chunk.isEmpty else {
+            guard let chunk = try handle.read(upToCount: min(Self.transferBufferSize, Int(remaining))), !chunk.isEmpty else {
                 try handle.close()
                 connection.cancel()
                 return
@@ -584,6 +852,7 @@ final class TransferHTTPServer {
                     connection.cancel()
                     return
                 }
+                self.touch(connection)
                 self.sendNextFileChunk(connection, handle: handle, remaining: remaining - Int64(chunk.count))
             })
         } catch {
@@ -617,8 +886,10 @@ final class TransferHTTPServer {
         case 403: reason = "Forbidden"
         case 404: reason = "Not Found"
         case 413: reason = "Payload Too Large"
+        case 415: reason = "Unsupported Media Type"
         case 416: reason = "Range Not Satisfiable"
         case 409: reason = "Conflict"
+        case 422: reason = "Unprocessable Content"
         default: reason = "Internal Server Error"
         }
         let header = Data((

@@ -28,12 +28,326 @@ paths:
                     properties:
                       mode: {type: string, enum: [inbox, automatic]}
                       folderPath: {type: string}
+                      inboxFolderPath: {type: string, description: Resolved temporary inbox folder configured in the Mac app.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/health:
+    get:
+      operationId: getHealth
+      responses:
+        '200':
+          description: Server is accepting authenticated requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {type: string, enum: [ok]}
         default: {$ref: '#/components/responses/Error'}
   /v1/inbox:
     get:
       operationId: listInbox
       responses:
         '200': {$ref: '#/components/responses/Items'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/shared-files:
+    get:
+      operationId: listSharedFiles
+      description: ShareStack received files by ID. Finder extension handoff may still be importing; pendingImportCount reports complete manifests waiting in the App Group.
+      parameters:
+        - {in: query, name: limit, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+        - {in: query, name: offset, schema: {type: integer, minimum: 0, maximum: 1000000, default: 0}}
+      responses:
+        '200':
+          description: Files received by ShareStack; paths are never returned.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, pendingImportCount]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name, size, extension, receivedAt, state]
+                      properties:
+                        id: {type: string, format: uuid}
+                        name: {type: string}
+                        size: {type: integer, format: int64}
+                        extension: {type: string}
+                        receivedAt: {type: number}
+                        state: {type: string}
+                  nextOffset: {type: integer}
+                  pendingImportCount: {type: integer}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/shared-files/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/ItemID'}
+    get:
+      operationId: getSharedFileInfo
+      description: Metadata only for a previously received ShareStack file ID.
+      responses:
+        '200':
+          description: File metadata and text-read availability.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, name, size, extension, mimeType, sha256, receivedAt, state, isReadable]
+                properties:
+                  id: {type: string, format: uuid}
+                  name: {type: string}
+                  size: {type: integer, format: int64}
+                  extension: {type: string}
+                  mimeType: {type: string}
+                  sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+                  receivedAt: {type: number}
+                  state: {type: string}
+                  isReadable: {type: boolean}
+                  reason: {type: string}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/shared-files/{id}/content:
+    parameters:
+      - {$ref: '#/components/parameters/ItemID'}
+    get:
+      operationId: readSharedFile
+      description: Actual UTF-8 text data in a bounded byte chunk. Binary and invalid UTF-8 files return errors.
+      parameters:
+        - {in: query, name: offset, schema: {type: integer, minimum: 0, default: 0}}
+        - {in: query, name: limit, schema: {type: integer, minimum: 4, maximum: 32768, default: 4096}}
+      responses:
+        '200':
+          description: UTF-8 text chunk, with nextOffset on a character boundary.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, content, offset, nextOffset, bytesRead, sizeBytes, hasMore]
+                properties:
+                  id: {type: string, format: uuid}
+                  content: {type: string}
+                  offset: {type: integer, format: int64}
+                  nextOffset: {type: integer, format: int64}
+                  bytesRead: {type: integer}
+                  sizeBytes: {type: integer, format: int64}
+                  hasMore: {type: boolean}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/pending:
+    get:
+      operationId: listPending
+      description: Files queued by this Mac and still waiting for the phone to fetch.
+      responses:
+        '200': {$ref: '#/components/responses/Items'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/items:
+    post:
+      operationId: receiveFile
+      description: Phone uploads a file to the Mac inbox. Alias of /v1/outbox/files with incoming origin.
+      parameters:
+        - in: header
+          name: X-Item-Name
+          required: true
+          schema: {type: string}
+          description: Base64url UTF-8 filename.
+        - in: header
+          name: X-Item-Mime
+          required: true
+          schema: {type: string}
+          description: Base64url UTF-8 MIME type.
+        - in: header
+          name: X-Item-SHA256
+          required: true
+          schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+      requestBody:
+        required: true
+        description: Raw file with Content-Length. Maximum 20 GiB.
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        '201':
+          description: Received item. Automatic receipt may return it already saved.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Item'}
+        '413': {description: File is larger than 20 GiB.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/items/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/ItemID'}
+    get:
+      operationId: getItem
+      description: Pending or awaiting-acceptance item metadata. Saved, acknowledged, or removed items return 404.
+      responses:
+        '200':
+          description: Item metadata.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Item'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/items/{id}/content:
+    parameters:
+      - {$ref: '#/components/parameters/ItemID'}
+    get:
+      operationId: getItemContent
+      description: Raw file bytes. Supports a single bytes range.
+      parameters:
+        - in: header
+          name: Range
+          required: false
+          schema: {type: string, example: 'bytes=0-1023'}
+          description: 'Single range: bytes=start-end/total where total matches the item size.'
+      responses:
+        '200':
+          description: Full file content.
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '206':
+          description: Partial content. Content-Range reports the returned bytes.
+          headers:
+            Content-Range:
+              schema: {type: string}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '416': {description: Invalid or unsatisfiable byte range.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/items/{id}/ack:
+    parameters:
+      - {$ref: '#/components/parameters/ItemID'}
+    post:
+      operationId: acknowledgeItem
+      description: Phone confirms it received a queued Mac item. The item leaves the outbox. Acknowledging an unknown or already-removed ID also returns 200.
+      responses:
+        '200':
+          description: Delivery recorded.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {type: string, enum: [delivered]}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/uploads:
+    post:
+      operationId: beginUpload
+      description: Start or resume a resumable phone-to-Mac upload. No request body.
+      parameters:
+        - in: header
+          name: X-Upload-ID
+          required: true
+          schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+          description: Upload identifier, equal to the file SHA-256.
+        - in: header
+          name: X-Item-Name
+          required: true
+          schema: {type: string}
+          description: Base64url UTF-8 filename.
+        - in: header
+          name: X-Item-Mime
+          required: true
+          schema: {type: string}
+          description: Base64url UTF-8 MIME type.
+        - in: header
+          name: X-Item-Size
+          required: true
+          schema: {type: integer, format: int64, minimum: 0, maximum: 21474836480}
+        - in: header
+          name: X-Item-SHA256
+          required: true
+          schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+      responses:
+        '200':
+          description: Current offset and completion state. Repeating a matching session resumes it.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadStatus'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/uploads/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/UploadID'}
+    put:
+      operationId: appendUploadChunk
+      description: Append one chunk. At most 8 MiB per request.
+      parameters:
+        - in: header
+          name: Content-Range
+          required: true
+          schema: {type: string, example: 'bytes=0-1048575/10485760'}
+          description: Must describe exactly Content-Length bytes and the declared upload size.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        '200':
+          description: New offset and completion state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadStatus'}
+        '409': {description: Chunk does not continue the stored upload.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/uploads/{id}/finish:
+    parameters:
+      - {$ref: '#/components/parameters/UploadID'}
+    post:
+      operationId: finishUpload
+      description: Verify the assembled SHA-256 and move the upload into the inbox. No request body.
+      responses:
+        '201':
+          description: Received item, or the existing item for a duplicate file.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Item'}
+        '409': {description: Upload is incomplete, missing, or failed checksum validation.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/jobs:
+    post:
+      operationId: submitJob
+      description: Start a transfer job. Job control is available only from this Mac (127.0.0.1 or ::1).
+      requestBody:
+        required: true
+        description: JSON up to 1 MiB.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/JobRequest'}
+      responses:
+        '201':
+          description: Queued job. Poll /v1/jobs/{id} while it runs.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+        '403': {description: Request did not originate from this Mac.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
+    get:
+      operationId: getJob
+      description: Running job progress. Finished jobs are removed from memory and return 404.
+      responses:
+        '200':
+          description: Current job state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/cancel:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
+    post:
+      operationId: cancelJob
+      description: Cancel the remaining items. No request body.
+      responses:
+        '200':
+          description: Job after the cancellation request.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
         default: {$ref: '#/components/responses/Error'}
   /v1/inbox/{id}/accept:
     parameters:
@@ -42,7 +356,7 @@ paths:
       operationId: acceptItem
       responses:
         '200':
-          description: Saved item. Repeated acceptance returns the same item.
+          description: Saved item. The item is removed from the store after saving, so repeating acceptance returns 404.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Item'}
@@ -86,19 +400,6 @@ paths:
                 properties:
                   id: {type: string}
                   status: {type: string, enum: [cancelled]}
-        default: {$ref: '#/components/responses/Error'}
-  /v1/history:
-    get:
-      operationId: listHistory
-      parameters:
-        - in: query
-          name: limit
-          schema: {type: integer, minimum: 1, maximum: 100, default: 50}
-        - in: query
-          name: offset
-          schema: {type: integer, minimum: 0, default: 0}
-      responses:
-        '200': {$ref: '#/components/responses/Items'}
         default: {$ref: '#/components/responses/Error'}
   /v1/events:
     get:
@@ -197,9 +498,20 @@ components:
       name: id
       required: true
       schema: {type: string, format: uuid}
+    UploadID:
+      in: path
+      name: id
+      required: true
+      schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+      description: Upload identifier, equal to the file SHA-256.
+    JobID:
+      in: path
+      name: id
+      required: true
+      schema: {type: string, format: uuid}
   responses:
     Error:
-      description: 400 invalid input, 401 unauthorized, 404 not found, 409 conflict, or 500 internal error.
+      description: 400 invalid input, 401 unauthorized, 403 loopback-only job control, 404 not found, 409 conflict, 413 file too large, 416 invalid byte range, or 500 internal error.
       content:
         application/json:
           schema:
@@ -225,7 +537,70 @@ components:
         size: {type: integer, format: int64}
         sha256: {type: string}
         origin: {type: string, enum: [mac, galaxy]}
-        state: {type: string, enum: [pending, delivered, received, awaitingAcceptance, saved]}
+        state:
+          type: string
+          enum: [pending, awaitingAcceptance, received, saved]
+          description: received is accepted only for items loaded from an older store; current code emits pending, awaitingAcceptance, or saved.
         createdAt: {type: number, description: Seconds since 2001-01-01 UTC.}
         savedPath: {type: string}
         saveError: {type: string}
+    UploadStatus:
+      type: object
+      required: [id, offset, complete]
+      properties:
+        id: {type: string, pattern: '^[0-9a-f]{64}$'}
+        offset: {type: integer, format: int64, minimum: 0}
+        complete: {type: boolean, description: True once all declared bytes are present.}
+    JobRequest:
+      type: object
+      required: [operation]
+      properties:
+        operation:
+          type: string
+          enum: [receive, receiveAll, cancelInbox, cancelOutbox, sendText, sendFiles, importFiles, receiveTextFile]
+        itemIDs:
+          type: array
+          description: Required for receive, cancelInbox, and cancelOutbox. 1-100 UUIDs.
+          minItems: 1
+          maxItems: 100
+          items: {type: string, format: uuid}
+        filePaths:
+          type: array
+          description: Required for sendFiles and importFiles. 1-16 absolute paths; importFiles applies the receipt settings.
+          minItems: 1
+          maxItems: 16
+          items: {type: string}
+        text:
+          type: string
+          description: Required for sendText. At most 512 KiB of UTF-8.
+        filename:
+          type: string
+          maxLength: 1024
+          description: Required for receiveTextFile. Used only as the incoming display name, never as a path.
+        content:
+          type: string
+          maxLength: 131072
+          description: Required for receiveTextFile. UTF-8 file content, limited to 128 KiB after UTF-8 encoding.
+    Job:
+      type: object
+      required: [id, operation, status, createdAt, updatedAt, total, completed, failures]
+      properties:
+        id: {type: string, format: uuid}
+        operation:
+          type: string
+          enum: [receive, receiveAll, cancelInbox, cancelOutbox, sendText, sendFiles, importFiles, receiveTextFile]
+        status:
+          type: string
+          enum: [queued, running, cancelling, succeeded, partial_failure, failed, cancelled]
+        createdAt: {type: number, description: Seconds since 2001-01-01 UTC.}
+        updatedAt: {type: number, description: Seconds since 2001-01-01 UTC.}
+        total: {type: integer, minimum: 0, description: Number of items in the job.}
+        completed: {type: integer, minimum: 0, description: Items processed so far, including failures.}
+        failures:
+          type: array
+          items:
+            type: object
+            required: [target, error]
+            properties:
+              target: {type: string}
+              error: {type: string}

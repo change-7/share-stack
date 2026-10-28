@@ -71,17 +71,25 @@ APK를 휴대전화로 내려받아 실행하세요. 브라우저나 파일 관�
 
 현재 제공되는 APK는 개발 및 테스트용 디버그 빌드입니다.
 
+`./gradlew assembleDebug`로 디버그 APK를, `./gradlew assembleRelease`로 R8 축소·리소스 축소가 적용된 릴리스 APK를 만듭니다. 릴리스 서명은 프로젝트 루트의 `keystore.properties`(`storeFile`, `storePassword`, `keyAlias`, `keyPassword`)가 있을 때 자동 적용되며, 이 파일과 키스토어는 git에서 제외됩니다. Android SDK 경로는 `ANDROID_HOME` 또는 `local.properties`로 지정합니다.
+
 ## Mac 앱
 
-Mac 메뉴 앱은 `./script/build_and_run.sh`로 빌드하고 실행합니다. 기존 실행을 종료한 뒤 최신 앱을 작업 폴더 최상단의 `ShareStackMac.app`에 반영합니다. Xcode에서는 `macos/ShareStackMac/ShareStackMac.xcodeproj`의 `ShareStackMac` scheme을 사용할 수 있습니다.
+Mac 메뉴 앱은 `./script/build_and_run.sh`로 Release 빌드하고 실행합니다. 기존 실행을 종료한 뒤 최신 앱을 작업 폴더 최상단의 `ShareStackMac.app`에 반영합니다. 디버거가 필요한 경우 `./script/build_and_run.sh --debug`로 Debug 빌드를 사용합니다. Xcode에서는 `macos/ShareStackMac/ShareStackMac.xcodeproj`의 `ShareStackMac` scheme을 사용할 수 있습니다. TLS 인증서 회귀 검사는 `./script/verify_tls.sh`로 실행합니다.
 
 1. Mac과 Galaxy를 같은 Wi-Fi에 연결하거나 두 기기에서 Tailscale을 켭니다.
 2. Mac의 Share Stack 메뉴에서 **QR** 탭을 열고 **Wi-Fi** 또는 **Tailscale**을 선택한 뒤 QR을 스캔합니다. Tailscale은 두 기기를 같은 Tailscale 네트워크에 연결하면 서로 다른 Wi-Fi나 모바일 데이터에서도 사용할 수 있습니다. Tailscale 주소가 표시되지 않으면 Mac에서 Tailscale을 연결하고 **새로고침**을 누릅니다. Galaxy의 **Mac 연결** 화면에서 **같은 Wi-Fi에서 Mac 검색**으로도 로컬 주소를 찾을 수 있습니다. 최초 연결에는 QR의 짝 토큰과 TLS 인증서 지문이 필요합니다. 수동 입력 값은 **연결 정보** 탭에서 연결 경로를 선택해 복사합니다.
 3. Galaxy Share Stack 상단 컴퓨터 버튼에서 **선택 보내기** 또는 **받기**를 누릅니다.
 
-전송 서버는 포트 `8765`에서 Bonjour 서비스 `_sharestack._tcp`를 광고하고, 루프백·로컬 사설 IPv4·Tailscale IPv4 연결을 받습니다. TLS 인증서 지문과 짝 토큰을 함께 확인합니다. 파일은 4 MiB 조각으로 전송하며 최대 크기는 20 GiB입니다. Mac 업로드 조각과 Galaxy 다운로드 조각은 디스크에 저장되므로 앱이나 연결이 중단돼도 다시 연결하면 마지막 위치부터 계속됩니다. 최종 파일은 SHA-256을 검증한 뒤 보관함에 기록합니다.
+전송 서버는 포트 `8765`에서 Bonjour 서비스 `_sharestack._tcp`를 광고하고, 루프백·로컬 사설 IPv4·Tailscale IPv4 연결을 받습니다. TLS 인증서 지문과 짝 토큰을 함께 확인합니다. 파일은 8 MiB 조각으로 전송하며 최대 크기는 20 GiB입니다. Mac 업로드 조각과 Galaxy 다운로드 조각은 디스크에 저장되므로 앱이나 연결이 중단돼도 다시 연결하면 마지막 위치부터 계속됩니다. 최종 파일은 SHA-256을 검증한 뒤 보관함에 기록합니다.
 
 메뉴 앱에서 파일을 선택하거나 클립보드 텍스트를 직접 추가하면 Galaxy 전송 대기열에 들어갑니다.
+
+### Galaxy에서 Mac 파일 받기
+
+Galaxy의 **Mac 연동 → 맥 대기 파일**에서 파일 이름과 크기를 확인하고 **선택 수신** 또는 **전체 수신**을 누릅니다. **자동 수신**은 기본적으로 꺼져 있으며, 켜면 15초 간격으로 Mac 대기열을 확인해 휴대폰 보관함에 받습니다. 알림에서 진행 상황을 확인하거나 중지할 수 있습니다. 자동 수신을 꺼도 수동 수신은 사용할 수 있습니다.
+
+APK뿐 아니라 문서·사진·영상·압축파일 등 모든 파일 형식을 같은 방식으로 송수신하며 이름과 MIME 형식을 유지합니다. APK를 받아도 자동 설치하지 않습니다. 자동 수신은 알림 권한과 연결된 Mac이 필요하며 Wi-Fi 또는 Tailscale 연결을 사용합니다. 앱 강제 종료 후에는 다시 열어야 자동 수신이 재개됩니다. Android의 배터리·네트워크 제한에 따라 확인이 지연될 수 있습니다.
 
 ### Mac 수신 방식과 보관함
 
@@ -98,7 +106,7 @@ Mac 메뉴 앱은 `./script/build_and_run.sh`로 빌드하고 실행합니다. �
 
 ## API
 
-외부 프로그램용 맥 API는 [API 사용 문서](docs/api.md)와 [OpenAPI 명세](docs/openapi.yaml)를 참고하세요. 보관함 조회·개별/전체 수신·취소·상태·기록·이벤트 조회와 휴대전화 송신 대기열 추가를 지원합니다.
+외부 프로그램용 맥 API는 [API 사용 문서](docs/api.md)와 [OpenAPI 명세](docs/openapi.yaml)를 참고하세요. 보관함 조회·개별/전체 수신·취소·상태·이벤트 조회와 휴대전화 송신 대기열 추가를 지원합니다. 완료 작업 상태는 메모리에 10분 동안 최대 20개 보관하며 앱 재시작 시 사라집니다. 완료 파일의 메타데이터는 보관하지 않습니다. 실제 저장 파일은 지정 폴더에 유지하며 수신 전 보관함과 송신 대기 파일만 앱에서 관리합니다.
 
 LinkDeck의 앱 API 연동에는 [MCP stdio 연결 문서](docs/linkdeck.md)를 참고하세요. 앱 번들에 `linkdeck.json`이 포함되며 같은 실행 파일의 `--mcp` 모드가 실제 GUI와 통신합니다. 파일 작업은 작업 ID를 반환하고 진행 상태·결과·취소를 별도 도구로 제공합니다.
 

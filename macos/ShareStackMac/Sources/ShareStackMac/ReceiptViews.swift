@@ -40,13 +40,7 @@ struct ReceiptSettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                StackBrandMark()
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("설정").font(.system(size: 21, weight: .semibold, design: .rounded))
-                    Text("Share Stack").font(.caption).foregroundStyle(.secondary)
-                }
-            }
+            Text("수신 방식").font(.headline)
             Picker("수신 방식", selection: Binding(
                 get: { model.receiptSettings.mode },
                 set: { model.setReceiptMode($0) }
@@ -76,6 +70,24 @@ struct ReceiptSettingsView: View {
             }
             .padding(12)
             .background(StackDesign.card, in: RoundedRectangle(cornerRadius: 14))
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("임시 보관 폴더", systemImage: "tray.fill").font(.headline)
+                    Spacer()
+                    Button("변경…") { model.chooseInboxFolder() }
+                        .disabled(model.isReceiving)
+                }
+                Text(model.receiptSettings.inboxFolderPath ?? "앱 기본 폴더")
+                    .font(.caption)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+                    .help(model.receiptSettings.inboxFolderPath ?? "앱 기본 폴더")
+                Text("보관함 파일의 위치입니다. 보관함에서 삭제하면 실제 파일도 삭제됩니다.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .background(StackDesign.card, in: RoundedRectangle(cornerRadius: 14))
             Spacer(minLength: 0)
             Text(model.receiptMessage)
                 .font(.caption)
@@ -83,10 +95,7 @@ struct ReceiptSettingsView: View {
                 .help(model.receiptMessage)
                 .accessibilityLabel("처리 상태: \(model.receiptMessage)")
         }
-        .padding(20)
-        .frame(width: 460, height: 360)
         .modifier(HiddenFocusRing())
-        .background(.regularMaterial)
         .tint(StackDesign.accent)
     }
 }
@@ -95,7 +104,7 @@ struct ReceiptInboxView: View {
     @ObservedObject var model: MacAppModel
     @State private var page = 0
 
-    private let itemsPerPage = 3
+    private let itemsPerPage = 6
 
     private var pageCount: Int {
         max(1, (model.inboxItems.count + itemsPerPage - 1) / itemsPerPage)
@@ -135,7 +144,7 @@ struct ReceiptInboxView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .help(model.receiptSettings.folderPath)
-                VStack(spacing: 6) {
+                VStack(spacing: 4) {
                     ForEach(visibleItems) { item in
                         HStack(spacing: 8) {
                             Image(systemName: StackDesign.fileSymbol(item.mimeType))
@@ -163,6 +172,14 @@ struct ReceiptInboxView: View {
                                 .controlSize(.small)
                                 .tint(StackDesign.accent)
                                 .accessibilityLabel("\(item.name) 수신")
+                            Button { model.addInboxItemToAIExchange(item) } label: {
+                                Image(systemName: "sparkles")
+                                    .frame(width: 22, height: 28)
+                                    .contentShape(Rectangle())
+                            }
+                                .buttonStyle(.plain)
+                                .help("AI Exchange로 복사")
+                                .accessibilityLabel("\(item.name)을 AI Exchange로 복사")
                             Button(role: .destructive) { model.cancelInboxItem(item) } label: {
                                 Image(systemName: "xmark")
                                     .font(.system(size: 10, weight: .semibold))
@@ -174,7 +191,8 @@ struct ReceiptInboxView: View {
                                 .help("이 파일의 임시 보관본을 삭제합니다.")
                                 .accessibilityLabel("\(item.name) 취소 및 임시 파일 삭제")
                         }
-                        .padding(8)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
                         .background(StackDesign.card, in: RoundedRectangle(cornerRadius: 12))
                     }
                 }
@@ -223,5 +241,97 @@ struct ReceiptInboxView: View {
         .tint(StackDesign.accent)
         .onAppear { model.refresh() }
         .onChange(of: model.inboxItems.count) { _ in page = currentPage }
+    }
+}
+
+struct AIExchangeView: View {
+    @ObservedObject var model: MacAppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("AI Exchange").font(.system(size: 16, weight: .semibold))
+                Text("\(model.aiExchangeItems.count)")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(StackDesign.accent)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(StackDesign.accent.opacity(0.12), in: Capsule())
+                Spacer()
+                if model.isReceiving { ProgressView().controlSize(.small) }
+            }
+            Toggle("AI 전체 읽기 허용", isOn: Binding(
+                get: { model.aiExchangeEnabled },
+                set: { model.setAIExchangeEnabled($0) }
+            ))
+                .font(.system(size: 12, weight: .medium))
+                .disabled(model.isReceiving)
+            Text("AI는 여기에 명시적으로 복사한 파일만 읽을 수 있습니다.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 7) {
+                    if !model.savedReceivedItems.isEmpty {
+                        Text("수신 완료 파일에서 복사")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        ForEach(model.savedReceivedItems) { item in
+                            HStack(spacing: 8) {
+                                Image(systemName: StackDesign.fileSymbol(item.mimeType))
+                                    .foregroundStyle(StackDesign.accent).frame(width: 25)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                                    Text(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file))
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                Button { model.addInboxItemToAIExchange(item) } label: {
+                                    Image(systemName: "sparkles").frame(width: 24, height: 28)
+                                }
+                                .buttonStyle(.plain)
+                                .help("AI Exchange로 복사")
+                                .accessibilityLabel("\(item.name)을 AI Exchange로 복사")
+                            }
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(StackDesign.card, in: RoundedRectangle(cornerRadius: 10))
+                        }
+                    }
+                    Text("AI Exchange 파일")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    if model.aiExchangeItems.isEmpty {
+                        Text("등록된 파일이 없습니다. 보관함에서 파일 옆의 ✨ 버튼을 눌러 복사하세요.")
+                            .font(.caption).foregroundStyle(.secondary).padding(.vertical, 8)
+                    }
+                    ForEach(model.aiExchangeItems) { file in
+                        HStack(spacing: 8) {
+                            Image(systemName: StackDesign.fileSymbol(file.mimeType))
+                                .foregroundStyle(StackDesign.accent).frame(width: 25)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(file.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                                Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            Button(role: .destructive) { model.deleteAIExchangeItem(file) } label: {
+                                Image(systemName: "trash").frame(width: 24, height: 28)
+                            }
+                            .buttonStyle(.plain)
+                            .help("AI Exchange에서 삭제")
+                            .accessibilityLabel("\(file.name) AI Exchange에서 삭제")
+                        }
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(StackDesign.card, in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+            }
+            .disabled(model.isReceiving)
+            if !model.receiptMessage.isEmpty {
+                Text(model.receiptMessage).font(.caption).lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .onAppear { model.refresh() }
     }
 }

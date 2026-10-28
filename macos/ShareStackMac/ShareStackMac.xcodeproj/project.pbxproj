@@ -14,6 +14,10 @@
 		A10000000000000000000009 = {isa = PBXBuildFile; fileRef = A10000000000000000000019; };
 		A1000000000000000000000A = {isa = PBXBuildFile; fileRef = A1000000000000000000001A; };
 		A1000000000000000000000B = {isa = PBXBuildFile; fileRef = A1000000000000000000001B; };
+		A1000000000000000000000C = {isa = PBXBuildFile; fileRef = A1000000000000000000001C; };
+		A1000000000000000000000D = {isa = PBXBuildFile; fileRef = A1000000000000000000001D; };
+		A1000000000000000000000E = {isa = PBXBuildFile; fileRef = A1000000000000000000001C; };
+		A1000000000000000000000F = {isa = PBXBuildFile; fileRef = A10000000000000000000022; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		A10000000000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareStackMacApp.swift; sourceTree = "<group>"; };
 		A10000000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransferStore.swift; sourceTree = "<group>"; };
 		A10000000000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkIdentity.swift; sourceTree = "<group>"; };
@@ -25,12 +29,18 @@
 		A10000000000000000000019 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPServer.swift; sourceTree = "<group>"; };
 		A1000000000000000000001A = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransferJobs.swift; sourceTree = "<group>"; };
 		A1000000000000000000001B = {isa = PBXFileReference; lastKnownFileType = text.json; path = Resources/linkdeck.json; sourceTree = "<group>"; };
+		A1000000000000000000001C = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareHandoff.swift; sourceTree = "<group>"; };
+		A1000000000000000000001D = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
+		A1000000000000000000001E = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A1000000000000000000001F = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ShareStackShareExtension.entitlements; sourceTree = "<group>"; };
 		A10000000000000000000021 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = ShareStackMac.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000022 = {isa = PBXFileReference; explicitFileType = wrapper.app-extension; path = ShareStackShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000031 = {
 			isa = PBXGroup;
-			children = (A10000000000000000000041, A10000000000000000000017, A1000000000000000000001B, A10000000000000000000021, );
+			children = (A10000000000000000000041, A10000000000000000000042, A10000000000000000000017, A1000000000000000000001B, A10000000000000000000021, A10000000000000000000022, );
 			sourceTree = "<group>";
 		};
+		A10000000000000000000042 = {isa = PBXGroup; children = (A1000000000000000000001D, A1000000000000000000001E, A1000000000000000000001F, ); path = ShareStackShareExtension; sourceTree = "<group>"; };
 		A10000000000000000000041 = {
 			isa = PBXGroup;
 			children = (
@@ -43,6 +53,7 @@
 				A10000000000000000000018,
 				A10000000000000000000019,
 				A1000000000000000000001A,
+				A1000000000000000000001C,
 			);
 			path = Sources/ShareStackMac;
 			sourceTree = "<group>";
@@ -60,25 +71,30 @@
 				A10000000000000000000008,
 				A10000000000000000000009,
 				A1000000000000000000000A,
+				A1000000000000000000000C,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A10000000000000000000061 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		A10000000000000000000062 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000007, A1000000000000000000000B, ); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000063 = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 13; files = (A1000000000000000000000F, ); name = "Embed App Extensions"; runOnlyForDeploymentPostprocessing = 0; };
 		A10000000000000000000071 = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = A10000000000000000000091;
-			buildPhases = (A10000000000000000000051, A10000000000000000000061, A10000000000000000000062, );
+			buildPhases = (A10000000000000000000051, A10000000000000000000061, A10000000000000000000062, A10000000000000000000063, );
 			buildRules = ();
-			dependencies = ();
+			dependencies = (A100000000000000000000D2, );
 			name = ShareStackMac;
 			productName = ShareStackMac;
 			productReference = A10000000000000000000021;
 			productType = "com.apple.product-type.application";
 		};
+		A10000000000000000000072 = {isa = PBXNativeTarget; buildConfigurationList = A10000000000000000000093; buildPhases = (A10000000000000000000073, A10000000000000000000074, A10000000000000000000075, ); buildRules = (); dependencies = (); name = ShareStackShareExtension; productName = ShareStackShareExtension; productReference = A10000000000000000000022; productType = "com.apple.product-type.app-extension"; };
+		A100000000000000000000D1 = {isa = PBXContainerItemProxy; containerPortal = A10000000000000000000081; proxyType = 1; remoteGlobalIDString = A10000000000000000000072; remoteInfo = ShareStackShareExtension; };
+		A100000000000000000000D2 = {isa = PBXTargetDependency; target = A10000000000000000000072; targetProxy = A100000000000000000000D1; };
 		A10000000000000000000081 = {
 			isa = PBXProject;
-			attributes = { BuildIndependentTargetsInParallel = 1; LastUpgradeCheck = 2700; TargetAttributes = { A10000000000000000000071 = { CreatedOnToolsVersion = 27.0; }; }; };
+			attributes = { BuildIndependentTargetsInParallel = 1; LastUpgradeCheck = 2700; TargetAttributes = { A10000000000000000000071 = { CreatedOnToolsVersion = 27.0; }; A10000000000000000000072 = { CreatedOnToolsVersion = 27.0; }; }; };
 			buildConfigurationList = A10000000000000000000092;
 			compatibilityVersion = "Xcode 15.0";
 			developmentRegion = en;
@@ -87,14 +103,20 @@
 			productRefGroup = A10000000000000000000031;
 			projectDirPath = "";
 			projectRoot = "";
-			targets = (A10000000000000000000071, );
+			targets = (A10000000000000000000071, A10000000000000000000072, );
 		};
 		A10000000000000000000091 = {isa = XCConfigurationList; buildConfigurations = (A100000000000000000000A1, A100000000000000000000A2); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		A10000000000000000000092 = {isa = XCConfigurationList; buildConfigurations = (A100000000000000000000B1, A100000000000000000000B2); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
-		A100000000000000000000A1 = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGNING_ALLOWED = NO; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Info.plist; MACOSX_DEPLOYMENT_TARGET = 13.0; PRODUCT_BUNDLE_IDENTIFIER = com.pdg.sharestack.mac; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Debug; };
-		A100000000000000000000A2 = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGNING_ALLOWED = NO; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Info.plist; MACOSX_DEPLOYMENT_TARGET = 13.0; PRODUCT_BUNDLE_IDENTIFIER = com.pdg.sharestack.mac; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Release; };
+		A100000000000000000000A1 = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_ENTITLEMENTS = ShareStackMac.entitlements; CODE_SIGNING_ALLOWED = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Info.plist; MACOSX_DEPLOYMENT_TARGET = 13.0; PRODUCT_BUNDLE_IDENTIFIER = com.pdg.sharestack.mac; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Debug; };
+		A100000000000000000000A2 = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_ENTITLEMENTS = ShareStackMac.entitlements; CODE_SIGNING_ALLOWED = YES; DEAD_CODE_STRIPPING = YES; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; DEPLOYMENT_POSTPROCESSING = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Info.plist; MACOSX_DEPLOYMENT_TARGET = 13.0; PRODUCT_BUNDLE_IDENTIFIER = com.pdg.sharestack.mac; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Release; };
 		A100000000000000000000B1 = {isa = XCBuildConfiguration; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Debug; };
 		A100000000000000000000B2 = {isa = XCBuildConfiguration; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Release; };
+		A100000000000000000000A3 = {isa = XCBuildConfiguration; buildSettings = { APPLICATION_EXTENSION_API_ONLY = YES; CODE_SIGN_ENTITLEMENTS = ShareStackShareExtension/ShareStackShareExtension.entitlements; CODE_SIGNING_ALLOWED = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ShareStackShareExtension/Info.plist; MACOSX_DEPLOYMENT_TARGET = 13.0; PRODUCT_BUNDLE_IDENTIFIER = com.pdg.sharestack.mac.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = macosx; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; }; name = Debug; };
+		A100000000000000000000A4 = {isa = XCBuildConfiguration; buildSettings = { APPLICATION_EXTENSION_API_ONLY = YES; CODE_SIGN_ENTITLEMENTS = ShareStackShareExtension/ShareStackShareExtension.entitlements; CODE_SIGNING_ALLOWED = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ShareStackShareExtension/Info.plist; MACOSX_DEPLOYMENT_TARGET = 13.0; PRODUCT_BUNDLE_IDENTIFIER = com.pdg.sharestack.mac.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = macosx; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; }; name = Release; };
+		A10000000000000000000093 = {isa = XCConfigurationList; buildConfigurations = (A100000000000000000000A3, A100000000000000000000A4); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A10000000000000000000073 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000D, A1000000000000000000000E, ); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000074 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000075 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 	};
 	rootObject = A10000000000000000000081;
 }

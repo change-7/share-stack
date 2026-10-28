@@ -30,22 +30,13 @@ final class MCPServer {
         "offset": ["type": "integer", "minimum": 0, "maximum": 1000000, "description": "Zero-based offset; default 0."]
     ]
     private static let tools: [Tool] = [
-        Tool(name: "get_status", description: "Read the running Share Stack GUI's receive settings, device addresses and inbox/outbox counts. Launches the GUI if needed; no pairing secrets are returned.", properties: [:]),
-        Tool(name: "list_inbox", description: "List actual temporary inbox files, newest first. Returns items and nextOffset; use IDs for receive_files or cancel_inbox_files.", properties: paging),
-        Tool(name: "get_item", description: "Read an actual transfer item's metadata, state, saved path and save error by UUID.", properties: ["id": uuid], required: ["id"]),
-        Tool(name: "list_history", description: "List transfer history from the GUI, newest first. Returns items and nextOffset.", properties: paging),
-        Tool(name: "list_outbox", description: "List files queued for the phone to fetch. Queued does not mean delivered; delivered status is available through get_item or list_history.", properties: paging),
-        Tool(name: "list_events", description: "Poll GUI file events. Pass after and streamID from the previous response. Recent 200 events are retained; restart or expired cursors require a fresh snapshot.", properties: ["after": ["type": "integer", "minimum": 0], "streamID": ["type": "string", "maxLength": 64]]),
-        Tool(name: "receive_files", description: "Start saving selected inbox files to the folder configured in the GUI. Returns a job ID immediately; poll get_job for saved paths and failures.", properties: ["ids": ids], required: ["ids"], readOnly: false, idempotent: false),
-        Tool(name: "receive_all", description: "Start saving all inbox files present when the job starts. Returns a job ID; partial failures stay in the inbox. Use only when the user requests all files.", properties: [:], readOnly: false, idempotent: false),
-        Tool(name: "cancel_inbox_files", description: "Delete selected temporary inbox files and their entries. Irreversible; call only for files the user explicitly asks to discard. Returns a job ID.", properties: ["ids": ids], required: ["ids"], readOnly: false, destructive: true, idempotent: false),
-        Tool(name: "cancel_outbox_files", description: "Remove selected pending phone transfers and their app-owned copies. Does not delete original source files or files already delivered. Returns a job ID.", properties: ["ids": ids], required: ["ids"], readOnly: false, destructive: true, idempotent: false),
-        Tool(name: "send_text", description: "Queue supplied text for the phone. Returns a job ID. The phone must fetch it; job success means queued, not delivered.", properties: ["text": ["type": "string", "minLength": 1, "maxLength": 131072]], required: ["text"], readOnly: false, idempotent: false),
-        Tool(name: "send_files", description: "Queue existing local regular files for the phone; originals are preserved. Absolute paths only, no symlinks, max 16 files and 20 GiB each. Returns a job ID; job success means queued, not delivered.", properties: ["paths": ["type": "array", "minItems": 1, "maxItems": 16, "items": ["type": "string", "minLength": 1, "maxLength": 4096]]], required: ["paths"], readOnly: false, idempotent: false, openWorld: true),
-        Tool(name: "add_inbox_files", description: "Import user-selected local regular files through the GUI's receive workflow. Originals are preserved. Receive settings decide temporary inbox or automatic save. Absolute paths only, max 16 files and 20 GiB each. Returns a job ID.", properties: ["paths": ["type": "array", "minItems": 1, "maxItems": 16, "items": ["type": "string", "minLength": 1, "maxLength": 4096]]], required: ["paths"], readOnly: false, idempotent: false, openWorld: true),
-        Tool(name: "get_job", description: "Read a GUI-owned job's status, completed/total counts, results and failures. Terminal states: succeeded, partial_failure, failed, cancelled, interrupted. Results survive MCP reconnects and GUI restarts.", properties: ["id": uuid], required: ["id"]),
-        Tool(name: "list_jobs", description: "List persisted GUI jobs, newest first, with results and errors. Work interrupted by a GUI restart is marked interrupted, not resumed automatically.", properties: paging),
-        Tool(name: "cancel_job", description: "Request cancellation of remaining job items. An in-flight file operation may finish first; completed moves and queued transfers are not undone. Terminal jobs are returned unchanged.", properties: ["id": uuid], required: ["id"], readOnly: false)
+        Tool(name: "list_shared_files", description: "List only files explicitly copied into ShareStack AI Exchange. Returns registered file IDs, names, sizes and extensions.", properties: paging),
+        Tool(name: "get_shared_file_info", description: "Read metadata for a file registered in AI Exchange. Other ShareStack inbox files and Mac paths are not visible.", properties: ["id": uuid], required: ["id"]),
+        Tool(name: "read_shared_file", description: "Read UTF-8 text from a registered AI Exchange file in byte-offset chunks up to 32 KiB. UTF-8 characters are not split.", properties: ["id": uuid, "offset": ["type": "integer", "minimum": 0, "maximum": 21474836480], "limit": ["type": "integer", "minimum": 4, "maximum": 32768]], required: ["id"]),
+        Tool(name: "receive_exchange_text_file", description: "Create a new UTF-8 text file in AI Exchange from supplied content. No Mac path is read. SHA-256 is calculated and verified; maximum content size is 128 KiB.", properties: ["filename": ["type": "string", "minLength": 1, "maxLength": 1024], "content": ["type": "string", "maxLength": 131072]], required: ["filename", "content"], readOnly: false, idempotent: false),
+        Tool(name: "receive_text_file", description: "Receive a small UTF-8 text file from supplied content; no Mac path or download link is read. Receive settings choose inbox or automatic save. SHA-256 is checked, duplicate content is deduplicated, and filename collisions are renamed when saved. Max 128 KiB of UTF-8 content.", properties: ["filename": ["type": "string", "minLength": 1, "maxLength": 1024], "content": ["type": "string", "maxLength": 131072]], required: ["filename", "content"], readOnly: false, idempotent: false),
+        Tool(name: "get_job", description: "Read the status of a text-receive job created by this AI connection.", properties: ["id": uuid], required: ["id"]),
+        Tool(name: "cancel_job", description: "Cancel a text-receive job created by this AI connection.", properties: ["id": uuid], required: ["id"], readOnly: false)
     ]
 
     func run() {
@@ -135,16 +126,30 @@ final class MCPServer {
         }
         switch name {
         case "get_status": return try request("GET", "/v1/status")
+        case "list_shared_files":
+            var components = URLComponents()
+            components.path = "/v1/shared-files"
+            components.queryItems = [.init(name: "limit", value: String(limit)), .init(name: "offset", value: String(offset))]
+            return try request("GET", components.string!)
+        case "get_shared_file_info": return try request("GET", "/v1/shared-files/" + (arguments["id"] as! String))
+        case "read_shared_file":
+            var components = URLComponents()
+            components.path = "/v1/shared-files/" + (arguments["id"] as! String) + "/content"
+            components.queryItems = [
+                .init(name: "offset", value: String(arguments["offset"] as? Int ?? 0)),
+                .init(name: "limit", value: String(arguments["limit"] as? Int ?? 4096))
+            ]
+            return try request("GET", components.string!)
         case "get_item": return try request("GET", "/v1/items/" + (arguments["id"] as! String))
         case "get_job": return try request("GET", "/v1/jobs/" + (arguments["id"] as! String))
         case "cancel_job": return try request("POST", "/v1/jobs/" + (arguments["id"] as! String) + "/cancel")
+        case "receive_exchange_text_file":
+            return try request("POST", "/v1/ai-exchange/text", body: [
+                "filename": arguments["filename"] as! String,
+                "content": arguments["content"] as! String
+            ])
         case "list_inbox", "list_outbox":
             return page(try request("GET", name == "list_inbox" ? "/v1/inbox" : "/v1/pending") as? [Any] ?? [])
-        case "list_history", "list_jobs":
-            let items = try request("GET", "\(name == "list_jobs" ? "/v1/jobs" : "/v1/history")?limit=\(limit)&offset=\(offset)")
-            var value: [String: Any] = ["items": items]
-            if (items as? [Any])?.count == limit { value["nextOffset"] = offset + limit }
-            return value
         case "list_events":
             var components = URLComponents()
             components.path = "/v1/events"
@@ -153,13 +158,14 @@ final class MCPServer {
             }
             return try request("GET", components.string!)
         default:
-            let operations = ["receive_files": "receive", "receive_all": "receiveAll", "cancel_inbox_files": "cancelInbox",
-                              "cancel_outbox_files": "cancelOutbox", "send_text": "sendText", "send_files": "sendFiles", "add_inbox_files": "importFiles"]
+            let operations = ["receive_text_file": "receiveTextFile"]
             guard let operation = operations[name] else { throw RPCError(code: -32602, message: "Unknown tool") }
             var payload: [String: Any] = ["operation": operation]
             if let ids = arguments["ids"] { payload["itemIDs"] = ids }
             if let paths = arguments["paths"] { payload["filePaths"] = paths }
             if let text = arguments["text"] { payload["text"] = text }
+            if let filename = arguments["filename"] { payload["filename"] = filename }
+            if let content = arguments["content"] { payload["content"] = content }
             return try request("POST", "/v1/jobs", body: payload)
         }
     }

@@ -28,6 +28,11 @@ public final class ShareSelectionReceiver extends BroadcastReceiver {
     @Override public void onReceive(Context context, Intent intent) {
         ArrayList<String> itemIds = intent.getStringArrayListExtra(ITEM_IDS);
         if (itemIds == null || itemIds.isEmpty()) return;
-        StackBadge.update(context, StackStore.remove(context, itemIds));
+        PendingResult pending = goAsync();
+        Context app = context.getApplicationContext();
+        BackgroundWork.run(() -> StackStore.remove(app, itemIds), (remaining, error) -> {
+            if (remaining != null) StackBadge.update(app, remaining);
+            pending.finish();
+        });
     }
 }

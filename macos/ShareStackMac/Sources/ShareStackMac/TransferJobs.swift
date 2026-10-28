@@ -3,12 +3,14 @@ import UniformTypeIdentifiers
 
 struct TransferJobRequest: Codable, Sendable {
     enum Operation: String, Codable, Sendable {
-        case receive, receiveAll, cancelInbox, cancelOutbox, sendText, sendFiles, importFiles
+        case receive, receiveAll, cancelInbox, cancelOutbox, sendText, sendFiles, importFiles, receiveTextFile
     }
     let operation: Operation
     var itemIDs: [String]?
     var filePaths: [String]?
     var text: String?
+    var filename: String?
+    var content: String?
 
     func validate() throws {
         switch operation {
@@ -19,6 +21,9 @@ struct TransferJobRequest: Codable, Sendable {
         case .receiveAll: break
         case .sendText:
             guard let text, !text.isEmpty, text.utf8.count <= 512 * 1024 else { throw JobError.invalidInput }
+        case .receiveTextFile:
+            guard let filename, !filename.isEmpty, filename.utf8.count <= 1024,
+                  let content, content.utf8.count <= 128 * 1024 else { throw JobError.invalidInput }
         case .sendFiles, .importFiles:
             guard let filePaths, (1...16).contains(filePaths.count),
                   filePaths.allSatisfy({ $0.hasPrefix("/") && !$0.contains("\0") }) else { throw JobError.invalidInput }
@@ -38,7 +43,6 @@ struct TransferJob: Codable, Sendable {
     var updatedAt: Date
     var total: Int
     var completed: Int
-    var results: [TransferItem]
     var failures: [Failure]
 
     var terminal: Bool { ["succeeded", "partial_failure", "failed", "cancelled", "interrupted"].contains(status) }
@@ -56,26 +60,26 @@ enum JobError: LocalizedError {
 
 final class TransferJobs: @unchecked Sendable {
     private let store: TransferStore
-    private let directory: URL
     private let lock = NSLock()
-    private let worker = DispatchQueue(label: "com.pdg.sharestack.jobs", qos: .userInitiated)
+    private let worker = DispatchQueue(label: "com.pdg.sharestack.jobs", qos: .userInitiated, autoreleaseFrequency: .workItem)
     private var jobs: [String: TransferJob] = [:]
     private var changeHandler: (() -> Void)?
+    private let now: () -> Date
+    private let expiryTimer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "com.pdg.sharestack.jobs.expiry"))
 
-    init(store: TransferStore) throws {
+    init(store: TransferStore, now: @escaping () -> Date = Date.init) {
         self.store = store
-        directory = try GUIBridge.directory().appendingPathComponent("jobs", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        for file in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) where file.pathExtension == "json" {
-            var job = try JSONDecoder().decode(TransferJob.self, from: Data(contentsOf: file))
-            if !job.terminal {
-                job.status = "interrupted"
-                job.updatedAt = Date()
-                try Self.write(job, to: file)
-            }
-            jobs[job.id] = job
+        self.now = now
+        expiryTimer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.pruneLocked()
+            self.lock.unlock()
         }
+        expiryTimer.resume()
     }
+
+    deinit { expiryTimer.cancel() }
 
     func setChangeHandler(_ handler: (() -> Void)?) {
         lock.lock()
@@ -86,15 +90,10 @@ final class TransferJobs: @unchecked Sendable {
     func submit(_ request: TransferJobRequest) throws -> TransferJob {
         try request.validate()
         let job = TransferJob(id: UUID().uuidString.lowercased(), operation: request.operation, status: "queued",
-                              createdAt: Date(), updatedAt: Date(), total: 0, completed: 0, results: [], failures: [])
+                              createdAt: Date(), updatedAt: Date(), total: 0, completed: 0, failures: [])
         lock.lock()
-        do {
-            try saveLocked(job)
-            lock.unlock()
-        } catch {
-            lock.unlock()
-            throw error
-        }
+        saveLocked(job)
+        lock.unlock()
         worker.async { [self] in execute(request, id: job.id) }
         return job
     }
@@ -102,24 +101,20 @@ final class TransferJobs: @unchecked Sendable {
     func get(_ id: String) throws -> TransferJob {
         lock.lock()
         defer { lock.unlock() }
+        pruneLocked()
         guard let job = jobs[id] else { throw JobError.notFound }
         return job
-    }
-
-    func list(limit: Int, offset: Int) -> [TransferJob] {
-        lock.lock()
-        defer { lock.unlock() }
-        return Array(jobs.values.sorted { $0.createdAt > $1.createdAt }.dropFirst(offset).prefix(limit))
     }
 
     func cancel(_ id: String) throws -> TransferJob {
         lock.lock()
         defer { lock.unlock() }
+        pruneLocked()
         guard var job = jobs[id] else { throw JobError.notFound }
         if job.terminal { return job }
         job.status = job.status == "queued" ? "cancelled" : "cancelling"
-        job.updatedAt = Date()
-        try saveLocked(job)
+        job.updatedAt = now()
+        saveLocked(job)
         return job
     }
 
@@ -128,18 +123,26 @@ final class TransferJobs: @unchecked Sendable {
         defer { lock.unlock() }
         guard var job = jobs[id] else { throw JobError.notFound }
         body(&job)
-        job.updatedAt = Date()
-        try saveLocked(job)
+        job.updatedAt = now()
+        saveLocked(job)
     }
 
-    private func saveLocked(_ job: TransferJob) throws {
-        try Self.write(job, to: directory.appendingPathComponent(job.id + ".json"))
+    private func saveLocked(_ job: TransferJob) {
         jobs[job.id] = job
+        pruneLocked()
     }
 
-    private static func write(_ job: TransferJob, to file: URL) throws {
-        try JSONEncoder().encode(job).write(to: file, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    private func pruneLocked() {
+        let completed = jobs.values.filter { $0.terminal }.sorted { $0.updatedAt > $1.updatedAt }
+        let cutoff = now().addingTimeInterval(-600)
+        for (index, job) in completed.enumerated() where index >= 20 || job.updatedAt <= cutoff {
+            jobs.removeValue(forKey: job.id)
+        }
+        if let oldest = jobs.values.filter({ $0.terminal }).map(\.updatedAt).min() {
+            expiryTimer.schedule(deadline: .now() + max(0, oldest.addingTimeInterval(600).timeIntervalSince(now())))
+        } else {
+            expiryTimer.schedule(deadline: .distantFuture)
+        }
     }
 
     private func notifyChanges() {
@@ -159,6 +162,7 @@ final class TransferJobs: @unchecked Sendable {
             case .receiveAll: targets = store.inboxItems().map(\.id)
             case .sendFiles, .importFiles: targets = request.filePaths ?? []
             case .sendText: targets = ["text"]
+            case .receiveTextFile: targets = [request.filename ?? "file"]
             default: targets = request.itemIDs?.map { $0.lowercased() } ?? []
             }
             try update(id) { $0.total = targets.count }
@@ -166,26 +170,29 @@ final class TransferJobs: @unchecked Sendable {
                 let current = try get(id)
                 if current.status == "cancelling" || current.status == "cancelled" { break }
                 do {
-                    var result: TransferItem?
                     switch request.operation {
-                    case .receive, .receiveAll: result = try store.acceptReceivedItem(target)
+                    case .receive, .receiveAll: _ = try store.acceptReceivedItem(target)
                     case .cancelInbox: try store.cancelReceivedItem(target)
                     case .cancelOutbox: try store.cancelOutgoingItem(target)
-                    case .sendText: result = try store.enqueueText(request.text ?? "")
+                    case .sendText: _ = try store.enqueueText(request.text ?? "")
+                    case .receiveTextFile:
+                        let filename = request.filename ?? "file"
+                        let ext = URL(fileURLWithPath: filename).pathExtension
+                        let mimeType = UTType(filenameExtension: ext)?.preferredMIMEType ?? "text/plain"
+                        _ = try store.receiveFileData(Data((request.content ?? "").utf8), name: filename, mimeType: mimeType)
                     case .sendFiles, .importFiles:
                         let url = URL(fileURLWithPath: target)
                         let attributes = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
                         guard attributes.isRegularFile == true, attributes.isSymbolicLink != true else { throw JobError.invalidInput }
                         let mimeType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
                         if request.operation == .importFiles {
-                            result = try store.importReceivedFile(url, mimeType: mimeType)
+                            _ = try store.importReceivedFile(url, mimeType: mimeType)
                         } else {
-                            result = try store.enqueueFile(url, mimeType: mimeType)
+                            _ = try store.enqueueFile(url, mimeType: mimeType)
                         }
                     }
                     try update(id) {
                         $0.completed += 1
-                        if let result { $0.results.append(result) }
                     }
                 } catch {
                     try update(id) {
@@ -209,9 +216,9 @@ final class TransferJobs: @unchecked Sendable {
             lock.lock()
             if var job = jobs[id] {
                 job.status = "failed"
+                job.updatedAt = now()
                 job.failures.append(.init(target: id, error: error.localizedDescription))
-                jobs[id] = job
-                try? Self.write(job, to: directory.appendingPathComponent(id + ".json"))
+                saveLocked(job)
             }
             lock.unlock()
             FileHandle.standardError.write(Data("Share Stack job failed: \(error.localizedDescription)\n".utf8))

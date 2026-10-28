@@ -7,8 +7,10 @@
   "tools": [
     "get_status",
     "list_inbox",
+    "list_shared_files",
+    "get_shared_file_info",
+    "read_shared_file",
     "get_item",
-    "list_history",
     "list_outbox",
     "list_events",
     "receive_files",
@@ -18,8 +20,8 @@
     "send_text",
     "send_files",
     "add_inbox_files",
+    "receive_text_file",
     "get_job",
-    "list_jobs",
     "cancel_job"
   ]
 }

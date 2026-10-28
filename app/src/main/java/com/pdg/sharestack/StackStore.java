@@ -30,7 +30,7 @@ final class StackStore {
 
     private StackStore() { }
 
-    static ArrayList<StackItem> load(Context context) {
+    static synchronized ArrayList<StackItem> load(Context context) {
         File directory = itemDirectory(context);
         ArrayList<StackItem> result = new ArrayList<>();
         String saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(ITEMS, "");
@@ -64,7 +64,7 @@ final class StackStore {
         return result;
     }
 
-    static boolean save(Context context, ArrayList<StackItem> items) {
+    static synchronized boolean save(Context context, ArrayList<StackItem> items) {
         StringBuilder data = new StringBuilder();
         for (StackItem item : items) {
             if (data.length() > 0) data.append('\n');
@@ -73,7 +73,21 @@ final class StackStore {
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(ITEMS, data.toString()).commit();
     }
 
-    static int remove(Context context, ArrayList<String> itemIds) {
+    static synchronized boolean hasFingerprint(Context context, String fingerprint) {
+        for (StackItem item : load(context)) if (fingerprint.equals(item.fingerprint)) return true;
+        return false;
+    }
+
+    static synchronized void saveKeepingIncoming(Context context, ArrayList<StackItem> items) {
+        for (StackItem incoming : load(context)) {
+            boolean present = false;
+            for (StackItem item : items) if (item.id.equals(incoming.id)) { present = true; break; }
+            if (!present) items.add(incoming);
+        }
+        save(context, items);
+    }
+
+    static synchronized int remove(Context context, ArrayList<String> itemIds) {
         ArrayList<StackItem> remaining = new ArrayList<>();
         for (StackItem item : load(context)) {
             if (itemIds.contains(item.id) && !item.locked) itemFile(context, item.id).delete();
@@ -83,7 +97,7 @@ final class StackStore {
         return remaining.size();
     }
 
-    static int removeUnlocked(Context context) {
+    static synchronized int removeUnlocked(Context context) {
         ArrayList<StackItem> items = load(context);
         ArrayList<String> itemIds = new ArrayList<>();
         for (StackItem item : items) if (!item.locked) itemIds.add(item.id);
@@ -92,8 +106,7 @@ final class StackStore {
 
     @SuppressWarnings("deprecation")
     static int receive(Context context, Intent intent) {
-        ArrayList<StackItem> items = load(context);
-        boolean added = false;
+        ArrayList<PendingItem> pending = new ArrayList<>();
         ArrayList<Uri> uris = new ArrayList<>();
         if (Intent.ACTION_SEND_MULTIPLE.equals(intent.getAction())) {
             ArrayList<Uri> multiple = android.os.Build.VERSION.SDK_INT >= 33
@@ -117,17 +130,38 @@ final class StackStore {
             .getBoolean(SAVE_URL_WITH_MEDIA, true);
         if (text != null && !text.isEmpty()
             && (uris.isEmpty() || saveUrlWithMedia || !isWebUrl(text))) {
-            String id = UUID.randomUUID().toString() + ".txt";
-            File destination = itemFile(context, id);
-            if (writeBytes(destination, text.getBytes(StandardCharsets.UTF_8))
-                && addUniqueItem(context, items, destination, "text/plain", shorten(text))) {
-                added = true;
+            File destination = itemFile(context, UUID.randomUUID().toString() + ".txt");
+            if (writeBytes(destination, text.getBytes(StandardCharsets.UTF_8))) {
+                pending.add(pendingItem(destination, "text/plain", shorten(text)));
             }
         }
-        for (Uri uri : uris) if (copyUri(context, uri, intent.getType(), items)) added = true;
+        for (Uri uri : uris) {
+            PendingItem copied = copyUri(context, uri, intent.getType());
+            if (copied != null) pending.add(copied);
+        }
 
-        if (added) save(context, items);
-        return items.size();
+        // Copying and hashing happen without the store lock so the UI can keep reading the stack.
+        synchronized (StackStore.class) {
+            ArrayList<StackItem> items = load(context);
+            ArrayList<StackItem> added = new ArrayList<>();
+            for (PendingItem incoming : pending) {
+                if (containsFingerprint(context, items, incoming)) {
+                    incoming.file.delete();
+                    continue;
+                }
+                StackItem item = new StackItem(incoming.file.getName(), incoming.mimeType, incoming.name,
+                    incoming.fingerprint);
+                items.add(item);
+                added.add(item);
+            }
+            if (!added.isEmpty() && !save(context, items)) {
+                for (StackItem item : added) {
+                    itemFile(context, item.id).delete();
+                    items.remove(item);
+                }
+            }
+            return items.size();
+        }
     }
 
     static File itemFile(Context context, String id) {
@@ -150,7 +184,7 @@ final class StackStore {
     }
 
     static void appendDownloadedRange(DownloadChunk chunk, InputStream input) throws IOException {
-        if (chunk.offset < 0 || chunk.length <= 0 || chunk.length > 4 * 1024 * 1024
+        if (chunk.offset < 0 || chunk.length <= 0 || chunk.length > 8 * 1024 * 1024
             || chunk.offset != chunk.partial.length()) {
             throw new IOException("다운로드 이어받기 위치가 올바르지 않습니다");
         }
@@ -165,7 +199,6 @@ final class StackStore {
                 remaining -= count;
             }
             if (input.read() != -1) throw new IOException("다운로드 조각이 예상 크기보다 큽니다");
-            output.getFD().sync();
         }
     }
 
@@ -173,6 +206,10 @@ final class StackStore {
         if (metadata.size < 0 || metadata.size > MAXIMUM_TRANSFER_SIZE
             || !metadata.sha256.matches("[0-9a-f]{64}") || partial.length() != metadata.size) {
             throw new IOException("받은 파일 정보가 올바르지 않습니다");
+        }
+        try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(
+            partial.toPath(), java.nio.file.StandardOpenOption.WRITE)) {
+            channel.force(true);
         }
         String actual = fingerprint(partial);
         if (!metadata.sha256.equals(actual)) {
@@ -185,13 +222,16 @@ final class StackStore {
         } catch (java.io.IOException exception) {
             throw new IOException("받은 파일을 보관함으로 옮기지 못했습니다", exception);
         }
-        ArrayList<StackItem> items = load(context);
-        boolean added = addUniqueItem(context, items, destination, metadata.mimeType, metadata.name);
-        if (added && !save(context, items)) {
-            destination.delete();
-            throw new IOException("받은 항목을 스택에 저장하지 못했습니다");
+        synchronized (StackStore.class) {
+            if (hasFingerprint(context, actual)) { destination.delete(); return false; }
+            ArrayList<StackItem> items = load(context);
+            items.add(new StackItem(destination.getName(), metadata.mimeType, metadata.name, actual));
+            if (!save(context, items)) {
+                destination.delete();
+                throw new IOException("받은 항목을 스택에 저장하지 못했습니다");
+            }
         }
-        return added;
+        return true;
     }
 
     static final class DownloadChunk {
@@ -261,21 +301,52 @@ final class StackStore {
         return directory;
     }
 
-    private static boolean copyUri(Context context, Uri uri, String fallbackType, ArrayList<StackItem> items) {
+    private static PendingItem copyUri(Context context, Uri uri, String fallbackType) {
         String id = UUID.randomUUID().toString();
         File destination = itemFile(context, id);
         try (InputStream input = context.getContentResolver().openInputStream(uri);
              FileOutputStream output = new FileOutputStream(destination)) {
-            if (input == null) return false;
-            byte[] buffer = new byte[8192];
+            if (input == null) {
+                destination.delete();
+                return null;
+            }
+            byte[] buffer = new byte[64 * 1024];
             int count;
             while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
             String type = context.getContentResolver().getType(uri);
             if (type == null) type = fallbackType == null ? "application/octet-stream" : fallbackType;
-            return addUniqueItem(context, items, destination, type, displayName(context, uri));
-        } catch (IOException ignored) {
+            return pendingItem(destination, type, displayName(context, uri));
+        } catch (IOException | IllegalStateException ignored) {
             destination.delete();
-            return false;
+            return null;
+        }
+    }
+
+    private static PendingItem pendingItem(File file, String mimeType, String name) {
+        return new PendingItem(file, mimeType, name, fingerprint(file));
+    }
+
+    private static boolean containsFingerprint(Context context, ArrayList<StackItem> items, PendingItem incoming) {
+        for (StackItem item : items) {
+            if (incoming.fingerprint.equals(item.fingerprint)
+                || (item.fingerprint == null && sameContents(incoming.file, itemFile(context, item.id)))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static final class PendingItem {
+        final File file;
+        final String mimeType;
+        final String name;
+        final String fingerprint;
+
+        PendingItem(File file, String mimeType, String name, String fingerprint) {
+            this.file = file;
+            this.mimeType = mimeType;
+            this.name = name;
+            this.fingerprint = fingerprint;
         }
     }
 

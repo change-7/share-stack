@@ -84,7 +84,7 @@ enum GUIBridge {
     static func request(_ method: String, path: String, body: Any? = nil, timeout: TimeInterval) throws -> Any {
         guard timeout > 0 else { throw BridgeError.message("GUI 응답 시간이 초과됐습니다. 다시 조회하세요") }
         let descriptor = try JSONDecoder().decode(Descriptor.self, from: Data(contentsOf: directory().appendingPathComponent("gui-bridge.json")))
-        let token = try NetworkIdentity.existingBearerToken()
+        let token = try NetworkIdentity.existingAIMCPBearerToken()
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout

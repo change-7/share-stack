@@ -23,6 +23,9 @@ import java.security.SecureRandom;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Set;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLPeerUnverifiedException;
@@ -34,8 +37,10 @@ final class MacBridgeClient {
     static final String HOST = "mac_bridge_host";
     static final String TOKEN = "mac_bridge_token";
     static final String TLS_PIN = "mac_bridge_tls_pin";
+    static final String AUTO_RECEIVE = "mac_bridge_auto_receive";
+    static final String RECEIVE_STATUS = "mac_bridge_receive_status";
     static final int PORT = 8765;
-    private static final int CHUNK_SIZE = 4 * 1024 * 1024;
+    private static final int CHUNK_SIZE = 8 * 1024 * 1024;
 
     private MacBridgeClient() { }
 
@@ -146,43 +151,87 @@ final class MacBridgeClient {
         return sent;
     }
 
-    static int receive(Context context, Pairing pairing) throws IOException {
+    interface ReceiveControl {
+        boolean cancelled();
+        void connection(HttpURLConnection connection);
+        void progress(PendingItem item, long offset);
+    }
+
+    static Pairing savedPairing(Context context) {
+        android.content.SharedPreferences preferences = context.getSharedPreferences(StackStore.PREFS, Context.MODE_PRIVATE);
+        return new Pairing(preferences.getString(HOST, ""), preferences.getString(TOKEN, ""), preferences.getString(TLS_PIN, ""));
+    }
+
+    static final class PendingItem {
+        final String id, name, mimeType, sha256;
+        final long size;
+
+        PendingItem(JSONObject value) throws org.json.JSONException, IOException {
+            id = value.getString("id");
+            name = value.getString("name");
+            mimeType = value.getString("mimeType");
+            sha256 = value.getString("sha256");
+            size = value.getLong("size");
+            if (!id.matches("[a-fA-F0-9]{8}(-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}")
+                || name.isEmpty() || mimeType.isEmpty() || size < 0 || size > StackStore.MAXIMUM_TRANSFER_SIZE
+                || !sha256.matches("[0-9a-f]{64}")) throw new IOException("Mac 파일 정보가 올바르지 않습니다");
+        }
+    }
+
+    static List<PendingItem> pending(Context context, Pairing pairing) throws IOException {
+        return pending(context, pairing, null);
+    }
+
+    private static List<PendingItem> pending(Context context, Pairing pairing, ReceiveControl control) throws IOException {
         pairing = validate(context, pairing);
         HttpURLConnection pendingConnection = open(pairing, "/v1/pending");
-        JSONArray pending;
+        track(control, pendingConnection);
         try {
             requireSuccess(pendingConnection);
             try (InputStream input = pendingConnection.getInputStream()) {
-                pending = new JSONArray(new String(readAll(input), StandardCharsets.UTF_8));
+                JSONArray values = new JSONArray(new String(readAll(input), StandardCharsets.UTF_8));
+                ArrayList<PendingItem> result = new ArrayList<>();
+                for (int index = 0; index < values.length(); index++) result.add(new PendingItem(values.getJSONObject(index)));
+                return result;
             } catch (org.json.JSONException exception) {
                 throw new IOException("Mac 응답을 읽을 수 없습니다", exception);
             }
         } finally {
             pendingConnection.disconnect();
         }
+    }
+
+    static int receive(Context context, Pairing pairing) throws IOException {
+        return receive(context, pairing, null, null);
+    }
+
+    static synchronized int receive(Context context, Pairing pairing, List<String> selectedIDs, ReceiveControl control) throws IOException {
+        pairing = validate(context, pairing);
+        List<PendingItem> pending = pending(context, pairing, control);
+        Set<String> selected = selectedIDs == null ? null : new HashSet<>(selectedIDs);
         int received = 0;
-        for (int index = 0; index < pending.length(); index++) {
-            JSONObject item;
+        IOException failure = null;
+        for (PendingItem item : pending) {
+            if (selected != null && !selected.contains(item.id)) continue;
+            checkCancelled(control);
             try {
-                item = pending.getJSONObject(index);
-                String id = item.getString("id");
-                if (!id.matches("[a-fA-F0-9-]{36}")) throw new IOException("Mac 항목 ID가 올바르지 않습니다");
-                String name = item.getString("name");
-                String mimeType = item.getString("mimeType");
-                long size = item.getLong("size");
-                String sha256 = item.getString("sha256");
-                if (size < 0 || size > StackStore.MAXIMUM_TRANSFER_SIZE || !sha256.matches("[0-9a-f]{64}")) {
-                    throw new IOException("Mac 파일 정보가 올바르지 않습니다");
+                if (control != null) control.progress(item, 0);
+                if (StackStore.hasFingerprint(context, item.sha256)) {
+                    acknowledge(pairing, item.id, control);
+                    continue;
                 }
-                File partial = StackStore.partialDownloadFile(context, id, size);
+                File partial = StackStore.partialDownloadFile(context, item.id, item.size);
                 long offset = partial.length();
-                while (offset < size) {
-                    int length = (int) Math.min(CHUNK_SIZE, size - offset);
-                    HttpURLConnection content = open(pairing, "/v1/items/" + id + "/content");
+                while (offset < item.size) {
+                    checkCancelled(control);
+                    if (control != null) control.progress(item, offset);
+                    int length = (int) Math.min(CHUNK_SIZE, item.size - offset);
+                    HttpURLConnection content = open(pairing, "/v1/items/" + item.id + "/content");
+                    track(control, content);
                     content.setRequestProperty("Range", "bytes=" + offset + "-" + (offset + length - 1));
                     try {
                         if (content.getResponseCode() != HttpURLConnection.HTTP_PARTIAL
-                            || !("bytes " + offset + "-" + (offset + length - 1) + "/" + size).equals(content.getHeaderField("Content-Range"))) {
+                            || !("bytes " + offset + "-" + (offset + length - 1) + "/" + item.size).equals(content.getHeaderField("Content-Range"))) {
                             throw new IOException("Mac 파일의 이어받기 응답이 올바르지 않습니다");
                         }
                         try (InputStream input = content.getInputStream()) {
@@ -193,24 +242,44 @@ final class MacBridgeClient {
                         content.disconnect();
                     }
                 }
-                StackStore.finishDownloadedFile(context, partial,
-                    new StackStore.DownloadMetadata(mimeType, name, size, sha256));
-                HttpURLConnection ack = open(pairing, "/v1/items/" + id + "/ack");
-                ack.setRequestMethod("POST");
-                ack.setDoOutput(true);
-                ack.setFixedLengthStreamingMode(0);
-                try {
-                    ack.getOutputStream().close();
-                    requireSuccess(ack);
-                } finally {
-                    ack.disconnect();
-                }
+                checkCancelled(control);
+                boolean added = StackStore.finishDownloadedFile(context, partial,
+                    new StackStore.DownloadMetadata(item.mimeType, item.name, item.size, item.sha256));
+                if (added) StackBadge.update(context, StackStore.load(context).size());
+                acknowledge(pairing, item.id, control);
                 received++;
-            } catch (org.json.JSONException exception) {
-                throw new IOException("Mac 전송 대기열 형식이 올바르지 않습니다", exception);
+            } catch (IOException exception) {
+                checkCancelled(control);
+                if (failure == null) failure = exception;
             }
         }
+        if (failure != null) throw new IOException("수신 " + received + "개 · 일부 실패: " + failure.getMessage(), failure);
         return received;
+    }
+
+    private static void acknowledge(Pairing pairing, String id, ReceiveControl control) throws IOException {
+        checkCancelled(control);
+        HttpURLConnection ack = open(pairing, "/v1/items/" + id + "/ack");
+        track(control, ack);
+        ack.setRequestMethod("POST");
+        ack.setDoOutput(true);
+        ack.setFixedLengthStreamingMode(0);
+        try {
+            ack.getOutputStream().close();
+            requireSuccess(ack);
+        } finally {
+            ack.disconnect();
+        }
+    }
+
+    private static void track(ReceiveControl control, HttpURLConnection connection) throws IOException {
+        if (control != null) control.connection(connection);
+        try { checkCancelled(control); }
+        catch (IOException exception) { connection.disconnect(); throw exception; }
+    }
+
+    private static void checkCancelled(ReceiveControl control) throws IOException {
+        if (Thread.currentThread().isInterrupted() || (control != null && control.cancelled())) throw new IOException("수신이 중지됐습니다");
     }
 
     private static HttpURLConnection open(Pairing pairing, String path) throws IOException {

@@ -423,17 +423,29 @@ public final class CaptureActivity extends ComponentActivity {
 
     private void saveCaptureAndShowFeedback(File file, String name, String type, boolean video) {
         showCaptureFeedback(file, video);
-        int before = StackStore.load(this).size();
+        final android.content.Context app = getApplicationContext();
         Uri uri = Uri.parse("content://com.pdg.sharestack.items/capture/" + file.getName()
             + "?name=" + Uri.encode(name) + "&type=" + Uri.encode(type));
-        int count = StackStore.receive(this, new Intent(Intent.ACTION_SEND)
+        final Intent intent = new Intent(Intent.ACTION_SEND)
             .setType(type)
-            .putExtra(Intent.EXTRA_STREAM, uri));
-        StackBadge.update(this, count);
-        file.delete();
-        shutter.setEnabled(true);
-        shutter.setContentDescription(videoModeSelected ? "동영상 녹화 시작" : "사진 촬영");
-        Toast.makeText(this, count > before ? "스택에 추가했습니다" : "이미 스택에 있는 항목입니다", Toast.LENGTH_SHORT).show();
+            .putExtra(Intent.EXTRA_STREAM, uri);
+        shutter.setEnabled(false);
+        BackgroundWork.run(() -> {
+            int before = StackStore.load(app).size();
+            int after = StackStore.receive(app, intent);
+            file.delete();
+            return new int[] {before, after};
+        }, (counts, error) -> {
+            shutter.setEnabled(true);
+            shutter.setContentDescription(videoModeSelected ? "동영상 녹화 시작" : "사진 촬영");
+            if (error != null || counts == null) {
+                Toast.makeText(app, "스택에 추가할 수 없습니다", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            StackBadge.update(app, counts[1]);
+            Toast.makeText(app, counts[1] > counts[0] ? "스택에 추가했습니다" : "이미 스택에 있는 항목입니다",
+                Toast.LENGTH_SHORT).show();
+        });
     }
 
     private void showCaptureFeedback(File file, boolean video) {

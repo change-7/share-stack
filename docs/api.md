@@ -4,6 +4,12 @@
 
 모든 요청에는 `Authorization: Bearer <토큰>`이 필요합니다. 메뉴의 **연결 정보**에서 토큰과 인증 지문을 복사합니다. 기존 기기 연결 토큰을 함께 사용하므로 이 토큰에는 파일 조회·저장·삭제 권한이 있습니다.
 
+## 임시 보관 위치
+
+맥 앱의 **설정 → 임시 보관 폴더 → 변경…**에서 위치를 고릅니다. 선택한 위치에 전용 `ShareStack Inbox` 하위 폴더를 만들며, 같은 이름의 폴더가 있으면 번호를 붙입니다. 기존 대기 파일을 복사하고 SHA-256을 확인한 뒤 설정을 전환합니다. 복사나 설정 저장이 실패하면 기존 위치를 유지합니다. `GET /v1/status`의 `receiptSettings.inboxFolderPath`는 실제 임시 보관 경로입니다.
+
+보관함에서 삭제·취소하면 해당 임시 파일도 삭제됩니다. 저장 수락 시에는 기존 `folderPath`로 옮깁니다. Finder 확장의 전달 대기 영역과 전송 중 작업 파일은 기존 앱 관리 공간을 계속 사용합니다. 외장 드라이브를 선택했다면 드라이브가 연결되어 있어야 합니다.
+
 ## 기능
 
 | 메서드 | 경로 | 동작 |
@@ -11,17 +17,19 @@
 | GET | `/v1/health` | 서버 응답 확인 |
 | GET | `/v1/status` | 주소, 수신 설정, 보관함·송신 대기 개수 |
 | GET | `/v1/inbox` | 임시 보관 중인 파일 목록 |
+| GET | `/v1/shared-files?limit=50&offset=0` | 수신·저장된 ShareStack 파일 목록과 Finder 가져오기 대기 수 |
+| GET | `/v1/shared-files/{id}` | 읽기 가능 여부, 크기, MIME, SHA-256 등 파일 정보 |
+| GET | `/v1/shared-files/{id}/content?offset=0&limit=4096` | ID로 허용된 UTF-8 텍스트의 실제 내용 청크 (최대 32 KiB) |
 | POST | `/v1/inbox/{id}/accept` | 한 파일을 설정된 폴더로 이동 |
 | POST | `/v1/inbox/accept-all` | 요청 시점의 모든 대기 파일 저장 |
 | DELETE | `/v1/inbox/{id}` | 임시 파일과 보관함 항목 삭제 |
-| GET | `/v1/history?limit=50&offset=0` | 최근 기록부터 조회. limit 1–100, offset 0 이상 |
 | GET | `/v1/events` | 수신·저장·취소 이벤트 조회 |
 | POST | `/v1/outbox/text` | 텍스트를 휴대전화 송신 대기열에 추가 |
 | POST | `/v1/outbox/files` | 파일을 휴대전화 송신 대기열에 추가 |
 | GET | `/v1/pending` | 휴대전화 송신 대기열 조회 |
 | GET | `/v1/items/{id}/content` | 파일 내용. 기존 bytes Range 지원 |
 
-수신·취소 요청에는 본문을 보내지 않습니다. 수신 폴더는 맥 앱 설정을 사용하며 API 요청으로 임의 경로를 지정할 수 없습니다. 저장 완료된 항목의 수신 요청은 기존 항목을 반환하며 다시 복사하지 않습니다. 취소는 수신 대기 항목에만 적용됩니다. 같은 이름은 번호를 붙여 저장합니다.
+수신·취소 요청에는 본문을 보내지 않습니다. 수신 폴더는 맥 앱 설정을 사용하며 API 요청으로 임의 경로를 지정할 수 없습니다. ChatGPT 읽기용 수신 ID는 저장 뒤에도 메타데이터를 유지하며, 파일을 삭제하면 읽기 불가로 반환합니다. 취소는 수신 대기 항목에만 적용됩니다. 같은 이름은 번호를 붙여 저장합니다.
 
 전체 수신 응답은 `{"saved": [...], "failed": [{"id": "...", "error": "..."}]}`입니다. 일부 실패도 HTTP 200이므로 `failed`를 확인해야 합니다. 실패한 파일은 보관함에 남습니다. API에서 변경한 결과는 앱 보관함과 메뉴바 배지에도 반영됩니다.
 
@@ -34,7 +42,7 @@
 - `X-Item-Mime`: MIME 형식을 같은 방식으로 인코딩한 값
 - `X-Item-SHA256`: 소문자 64자리 SHA-256
 
-기존 휴대전화→맥 전송 API인 `/v1/items`, `/v1/uploads`, `/v1/uploads/{sha256}`, `/v1/uploads/{sha256}/finish`, `/v1/items/{id}/ack`는 유지합니다. 송신 대기열에 넣을 때는 `/v1/outbox/*`를 사용합니다.
+기존 휴대전화→맥 전송 API인 `/v1/items`, `/v1/uploads`, `/v1/uploads/{sha256}`, `/v1/uploads/{sha256}/finish`, `/v1/items/{id}/ack`는 유지합니다. 송신 대기열에 넣을 때는 `/v1/outbox/*`를 사용합니다. `/v1/items/{id}/ack`는 이미 제거된 ID에도 200을 반환합니다(멱등).
 
 ## 인증 지문을 확인하는 호출 예
 
@@ -99,9 +107,9 @@ print(request("GET", "/v1/inbox"))
 }
 ```
 
-다음 조회는 `/v1/events?after=2&streamID=응답의ID`로 요청합니다. `hasMore`가 true면 다음 커서로 계속 조회합니다. false면 원하는 간격으로 재조회합니다. 이벤트 종류는 `file.received`, `file.saved`, `file.cancelled`, `file.save_failed`이며 실패 이벤트에는 `error`가 포함됩니다. UI 조작과 API 조작 모두 기록합니다.
+다음 조회는 `/v1/events?after=2&streamID=응답의ID`로 요청합니다. `hasMore`가 true면 다음 커서로 계속 조회합니다. false면 원하는 간격으로 재조회합니다. 이벤트 종류는 `file.received`, `file.saved`, `file.cancelled`, `file.save_failed`, `outbox.cancelled`이며 실패 이벤트에는 `error`가 포함됩니다. UI 조작과 API 조작 모두 기록합니다.
 
-이벤트는 메모리에 최근 200개를 유지하고 한 번에 최대 100개 반환합니다. 앱 재실행 또는 오래된 커서는 HTTP 409입니다. 이때 보관함·기록을 다시 읽고 커서 없이 이벤트 조회를 시작합니다. 푸시 알림이나 웹훅은 제공하지 않습니다.
+이벤트는 메모리에 최근 200개를 유지하고 한 번에 최대 100개 반환합니다. 앱 재실행 또는 오래된 커서는 HTTP 409입니다. 이때 보관함을 다시 읽고 커서 없이 이벤트 조회를 시작합니다. 과거 전송 기록 조회는 제공하지 않습니다. 푸시 알림이나 웹훅은 제공하지 않습니다.
 
 항목과 이벤트의 `createdAt`은 2001-01-01 00:00:00 UTC 이후 초입니다. Unix 초로 변환하려면 `978307200`을 더합니다.
 

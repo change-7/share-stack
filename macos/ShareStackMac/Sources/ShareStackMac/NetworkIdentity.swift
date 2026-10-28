@@ -1,6 +1,5 @@
 import Darwin
 import Foundation
-import LocalAuthentication
 import Security
 
 enum NetworkIdentity {
@@ -90,24 +89,27 @@ enum NetworkIdentity {
         try storedSecret(account: "pairing-token", create: false)
     }
 
+    static func aiMCPBearerToken() throws -> String {
+        try storedSecret(account: "ai-mcp-token")
+    }
+
+    static func existingAIMCPBearerToken() throws -> String {
+        try storedSecret(account: "ai-mcp-token", create: false)
+    }
+
     static func tlsArchivePassword() throws -> String {
         try storedSecret(account: "tls-archive-password")
     }
 
     private static func storedSecret(account: String, create: Bool = true) throws -> String {
         let service = "com.pdg.sharestack.mac.bridge"
-        var query: [String: Any] = [
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
-        if !create {
-            let context = LAContext()
-            context.interactionNotAllowed = true
-            query[kSecUseAuthenticationContext as String] = context
-        }
         var value: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &value)
         if status == errSecSuccess, let data = value as? Data {

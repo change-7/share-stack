@@ -3,6 +3,9 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <application
@@ -26,8 +29,7 @@
         </activity>
         <activity
             android:name=".ShareReceiverActivity"
-            android:exported="true"
-            android:theme="@android:style/Theme.NoDisplay">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <action android:name="android.intent.action.SEND_MULTIPLE" />
@@ -37,8 +39,7 @@
         </activity>
         <activity
             android:name=".NotificationShareActivity"
-            android:exported="false"
-            android:theme="@android:style/Theme.NoDisplay" />
+            android:exported="false" />
         <activity
             android:name=".CaptureActivity"
             android:exported="false" />
@@ -72,6 +73,7 @@
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
         </service>
+        <service android:name=".MacReceiveService" android:exported="false" android:foregroundServiceType="connectedDevice" />
         <receiver
             android:name=".ShareSelectionReceiver"
             android:exported="false" />

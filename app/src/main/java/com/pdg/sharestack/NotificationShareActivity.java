@@ -3,7 +3,6 @@ package com.pdg.sharestack;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
-import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
@@ -77,23 +76,20 @@ public final class NotificationShareActivity extends Activity {
     }
 
     private void launch(Prepared prepared) {
-        if (prepared.uris.isEmpty()) {
-            if (!prepared.text.isEmpty()) copyText(prepared.text);
-            if (prepared.clearAfterShare) clearUnlockedStack();
-            finish();
-            return;
-        }
-        Intent send = new Intent(prepared.uris.size() == 1 ? Intent.ACTION_SEND : Intent.ACTION_SEND_MULTIPLE);
+        if (prepared.uris.isEmpty() && prepared.text.isEmpty()) { finish(); return; }
+        Intent send = new Intent(prepared.uris.size() <= 1 ? Intent.ACTION_SEND : Intent.ACTION_SEND_MULTIPLE);
         send.setType(prepared.type);
-        ClipData clipData = ClipData.newRawUri("Share Stack items", prepared.uris.get(0));
-        for (int index = 1; index < prepared.uris.size(); index++) {
-            clipData.addItem(new ClipData.Item(prepared.uris.get(index)));
+        if (!prepared.uris.isEmpty()) {
+            ClipData clipData = ClipData.newRawUri("Share Stack items", prepared.uris.get(0));
+            for (int index = 1; index < prepared.uris.size(); index++) {
+                clipData.addItem(new ClipData.Item(prepared.uris.get(index)));
+            }
+            send.setClipData(clipData);
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         }
-        send.setClipData(clipData);
-        send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         if (prepared.uris.size() == 1) send.putExtra(Intent.EXTRA_STREAM, prepared.uris.get(0));
-        else send.putParcelableArrayListExtra(Intent.EXTRA_STREAM, prepared.uris);
-        if (!prepared.text.isEmpty()) copyText(prepared.text);
+        else if (!prepared.uris.isEmpty()) send.putParcelableArrayListExtra(Intent.EXTRA_STREAM, prepared.uris);
+        if (!prepared.text.isEmpty()) send.putExtra(Intent.EXTRA_TEXT, prepared.text);
         Intent chooser = prepared.clearAfterShare
             ? Intent.createChooser(send, "선택 항목 공유", ShareSelectionReceiver.forItems(this, prepared.items))
             : Intent.createChooser(send, "선택 항목 공유");
@@ -153,15 +149,6 @@ public final class NotificationShareActivity extends Activity {
             if (itemSlash <= 0 || !family.equals(item.mimeType.substring(0, itemSlash))) return "*/*";
         }
         return exactMatch ? type : family + "/*";
-    }
-
-    private void copyText(String text) {
-        ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE))
-            .setPrimaryClip(ClipData.newPlainText("Share Stack", text));
-    }
-
-    private void clearUnlockedStack() {
-        StackBadge.update(this, StackStore.removeUnlocked(this));
     }
 
     private static Uri contentUri(String directory, String id, String name, String type) {

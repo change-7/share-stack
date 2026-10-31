@@ -20,6 +20,7 @@ import java.util.UUID;
 final class StackStore {
     static final String PREFS = "stack";
     static final String ITEMS = "items";
+    private static final String AUTO_SEND_QUEUE = "mac_bridge_auto_send_queue";
     static final String CLEAR_STACK_AFTER_SHARE = "clear_and_close_after_share";
     static final String OPEN_AFTER_RECEIVING = "open_after_receiving";
     static final String SHOW_NOTIFICATION_SHARE_ACTION = "show_notification_share_action";
@@ -71,6 +72,46 @@ final class StackStore {
             data.append(item.serialize());
         }
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(ITEMS, data.toString()).commit();
+    }
+
+    private static synchronized boolean saveWithAutoSend(Context context, ArrayList<StackItem> items, ArrayList<StackItem> added) {
+        SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        MacBridgeClient.Pairing pairing = MacBridgeClient.savedPairing(context);
+        if (!prefs.getBoolean(MacBridgeClient.AUTO_SEND, false) || !MacBridgeClient.isValidPairing(pairing)) return save(context, items);
+        java.util.Set<String> queue = new java.util.HashSet<>(prefs.getStringSet(AUTO_SEND_QUEUE, java.util.Collections.emptySet()));
+        for (StackItem item : added) queue.add(pairing.host + "\t" + pairing.certificatePin + "\t" + item.id);
+        StringBuilder data = new StringBuilder();
+        for (StackItem item : items) {
+            if (data.length() > 0) data.append('\n');
+            data.append(item.serialize());
+        }
+        return prefs.edit().putString(ITEMS, data.toString()).putStringSet(AUTO_SEND_QUEUE, queue).commit();
+    }
+
+    static synchronized boolean updateVerifiedHost(Context context, MacBridgeClient.Pairing expected, String host) {
+        SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        MacBridgeClient.Pairing current = MacBridgeClient.savedPairing(context);
+        if (!AutoReconnect.samePairing(expected.host, expected.token, expected.certificatePin,
+            current.host, current.token, current.certificatePin)) return false;
+        java.util.Set<String> queue = AutoReconnect.readdress(
+            prefs.getStringSet(AUTO_SEND_QUEUE, java.util.Collections.emptySet()), expected.host, host, expected.certificatePin);
+        return prefs.edit().putString(MacBridgeClient.HOST, host).putStringSet(AUTO_SEND_QUEUE, queue).commit();
+    }
+
+    static synchronized ArrayList<StackItem> pendingAutoSend(Context context, MacBridgeClient.Pairing pairing) {
+        java.util.Set<String> queue = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getStringSet(AUTO_SEND_QUEUE, java.util.Collections.emptySet());
+        String prefix = pairing.host + "\t" + pairing.certificatePin + "\t";
+        ArrayList<StackItem> pending = new ArrayList<>();
+        for (StackItem item : load(context)) if (queue.contains(prefix + item.id)) pending.add(item);
+        return pending;
+    }
+
+    static synchronized void finishAutoSend(Context context, MacBridgeClient.Pairing pairing, String id) {
+        SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        java.util.Set<String> queue = new java.util.HashSet<>(prefs.getStringSet(AUTO_SEND_QUEUE, java.util.Collections.emptySet()));
+        queue.remove(pairing.host + "\t" + pairing.certificatePin + "\t" + id);
+        prefs.edit().putStringSet(AUTO_SEND_QUEUE, queue).commit();
     }
 
     static synchronized boolean hasFingerprint(Context context, String fingerprint) {
@@ -154,7 +195,7 @@ final class StackStore {
                 items.add(item);
                 added.add(item);
             }
-            if (!added.isEmpty() && !save(context, items)) {
+            if (!added.isEmpty() && !saveWithAutoSend(context, items, added)) {
                 for (StackItem item : added) {
                     itemFile(context, item.id).delete();
                     items.remove(item);
@@ -373,11 +414,18 @@ final class StackStore {
     }
 
     static String fingerprint(File file) {
+        return fingerprint(file, () -> false);
+    }
+
+    static String fingerprint(File file, java.util.function.BooleanSupplier cancelled) {
         try (InputStream input = new java.io.FileInputStream(file)) {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] buffer = new byte[8192];
             int count;
-            while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count);
+            while ((count = input.read(buffer)) != -1) {
+                if (cancelled.getAsBoolean() || Thread.currentThread().isInterrupted()) throw new IOException("전송이 중지됐습니다");
+                digest.update(buffer, 0, count);
+            }
             StringBuilder result = new StringBuilder();
             for (byte value : digest.digest()) result.append(String.format("%02x", value & 0xff));
             return result.toString();

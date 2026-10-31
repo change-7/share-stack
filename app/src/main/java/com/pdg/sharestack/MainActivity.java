@@ -10,7 +10,6 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
-import android.content.ClipboardManager;
 import android.content.res.ColorStateList;
 import android.content.Context;
 import android.content.Intent;
@@ -39,8 +38,9 @@ import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
 import android.provider.MediaStore;
-import android.provider.DocumentsContract;
 import android.text.TextUtils;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.view.DragEvent;
 import android.view.Gravity;
 import android.view.View;
@@ -61,10 +61,8 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -72,7 +70,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.text.SimpleDateFormat;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -82,9 +79,6 @@ public final class MainActivity extends Activity {
     private static final String GRID_MODE = "grid";
     private static final String LIST_MODE = "list";
     private static final int BADGE_PERMISSION_REQUEST = 1002;
-    private static final int ARCHIVE_FOLDER_REQUEST = 1004;
-    private static final String ARCHIVE_FOLDER_URI = "archive_folder_uri";
-    private static final String ARCHIVE_FOLDER_NAME = "archive_folder_name";
     private static final String SORT_MODE = "sort_mode";
     private static final int SORT_MANUAL = 0;
     private static final int SORT_NEWEST = 1;
@@ -103,15 +97,18 @@ public final class MainActivity extends Activity {
     private final ArrayList<CheckBox> selections = new ArrayList<>();
     private final ArrayList<String> selectedItemIds = new ArrayList<>();
     private LinearLayout list;
-    private TextView selectionSummary;
     private Button shareButton;
-    private Button copyButton;
-    private Button archiveButton;
+    private Button deviceSendButton;
+    private boolean deviceSending;
+    private ImageButton macBridgeButton;
+    private View macConnectionDot;
+    private final Handler connectionHandler = new Handler(Looper.getMainLooper());
+    private int connectionGeneration;
+    private boolean connectionCheckingActive;
+    private boolean wifiDiscoveryInProgress;
+    private final Runnable checkMacConnection = this::checkMacConnection;
     private Button deleteButton;
     private Button selectionToggleButton;
-    private Button archiveFolderSettingButton;
-    private ArrayList<String> pendingArchiveItemIds;
-    private boolean archivingItems;
     private boolean selectionsInitialized;
     private ScrollView scrollView;
     private volatile int renderGeneration;
@@ -168,16 +165,33 @@ public final class MainActivity extends Activity {
     @Override public void onResume() {
         super.onResume();
         getSharedPreferences(PREFS, MODE_PRIVATE).registerOnSharedPreferenceChangeListener(incomingListener);
-        if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(MacBridgeClient.AUTO_RECEIVE, false)) MacReceiveService.start(this, null);
+        AIReadSync.preferences(this).registerOnSharedPreferenceChangeListener(aiReadListener);
+        if (!AIReadSync.pending(this).isEmpty()) MacReceiveService.syncAI(this);
+        if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(MacBridgeClient.AUTO_RECEIVE, false)
+            || getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(MacBridgeClient.AUTO_SEND, false)) MacReceiveService.start(this, null);
+        else MacReceiveService.checkOnOpen(this);
         if (list != null) reloadItems();
+        connectionCheckingActive = true;
+        refreshMacConnection();
     }
 
     private final SharedPreferences.OnSharedPreferenceChangeListener incomingListener = (preferences, key) -> {
         if (StackStore.ITEMS.equals(key)) runOnUiThread(() -> { if (list != null) reloadItems(); });
+        if (MacBridgeClient.HOST.equals(key) || MacBridgeClient.TOKEN.equals(key) || MacBridgeClient.TLS_PIN.equals(key)) {
+            runOnUiThread(this::refreshMacConnection);
+        }
+    };
+
+    private final SharedPreferences.OnSharedPreferenceChangeListener aiReadListener = (preferences, key) -> {
+        if (AIReadSync.INTENTS.equals(key)) runOnUiThread(() -> { if (list != null) render(); });
     };
 
     @Override public void onPause() {
+        connectionCheckingActive = false;
+        connectionGeneration++;
+        connectionHandler.removeCallbacks(checkMacConnection);
         getSharedPreferences(PREFS, MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(incomingListener);
+        AIReadSync.preferences(this).unregisterOnSharedPreferenceChangeListener(aiReadListener);
         super.onPause();
     }
 
@@ -214,34 +228,29 @@ public final class MainActivity extends Activity {
 
         LinearLayout toolbar = new LinearLayout(this);
         toolbar.setGravity(Gravity.CENTER_VERTICAL);
-        toolbar.setPadding(0, 0, dp(18), 0);
-        ImageButton camera = new ImageButton(this);
-        styleIconButton(camera, R.drawable.ic_camera, "카메라로 추가");
-        camera.setOnClickListener(v -> startCapture());
-        ImageButton macBridge = new ImageButton(this);
-        styleIconButton(macBridge, R.drawable.ic_computer, "기기 연결");
-        macBridge.setOnClickListener(v -> showMacBridge());
+        macBridgeButton = new ImageButton(this);
+        styleIconButton(macBridgeButton, R.drawable.ic_computer, "기기 연결");
+        macBridgeButton.setOnClickListener(v -> showMacBridge());
+        FrameLayout macBridge = new FrameLayout(this);
+        macBridge.addView(macBridgeButton, new FrameLayout.LayoutParams(-1, -1));
+        macConnectionDot = new View(this);
+        macConnectionDot.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        FrameLayout.LayoutParams dotParams = new FrameLayout.LayoutParams(dp(12), dp(12), Gravity.TOP | Gravity.END);
+        dotParams.setMargins(0, dp(3), dp(3), 0);
+        macBridge.addView(macConnectionDot, dotParams);
+        setMacConnectionState(false, false);
         ImageButton settings = new ImageButton(this);
         styleIconButton(settings, R.drawable.ic_settings, "설정");
         settings.setOnClickListener(v -> showSettings());
-        selectionSummary = new TextView(this);
-        selectionSummary.setTextSize(13);
-        selectionSummary.setGravity(Gravity.CENTER);
-        selectionSummary.setPadding(dp(4), 0, dp(4), 0);
-        selectionSummary.setSingleLine(true);
-        selectionSummary.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        selectionSummary.setBackground(roundedBackground(0xffe9efff, 0, 50));
-        LinearLayout.LayoutParams summaryParams = new LinearLayout.LayoutParams(0, dp(32), 1);
-        summaryParams.setMargins(dp(4), 0, dp(4), 0);
         selectionToggleButton = new Button(this);
         styleActionButton(selectionToggleButton, 0xffeef3ff, PRIMARY_DARK, 0, 14, 12);
         selectionToggleButton.setOnClickListener(v -> toggleAllItems());
         LinearLayout.LayoutParams selectionToggleParams = new LinearLayout.LayoutParams(dp(80), dp(40));
         selectionToggleParams.setMargins(0, 0, dp(4), 0);
-        toolbar.addView(camera, new LinearLayout.LayoutParams(dp(48), dp(48)));
-        toolbar.addView(selectionSummary, summaryParams);
         toolbar.addView(selectionToggleButton, selectionToggleParams);
+        toolbar.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
         toolbar.addView(macBridge, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        toolbar.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
         toolbar.addView(settings, new LinearLayout.LayoutParams(dp(48), dp(48)));
         LinearLayout.LayoutParams toolbarParams = new LinearLayout.LayoutParams(-1, dp(48));
         toolbarParams.setMargins(0, 0, 0, dp(12));
@@ -265,15 +274,11 @@ public final class MainActivity extends Activity {
         shareButton = new Button(this);
         styleActionButton(shareButton, PRIMARY, Color.WHITE, 0, 14, 12);
         shareButton.setOnClickListener(v -> shareSelected());
-        copyButton = new Button(this);
-        copyButton.setText("텍스트 복사");
-        styleActionButton(copyButton, 0xffeef3ff, PRIMARY_DARK, 0, 14, 12);
-        copyButton.setOnClickListener(v -> copySelectedContent());
-        archiveButton = new Button(this);
-        archiveButton.setText("보관");
-        styleActionButton(archiveButton, 0xffeef3ff, PRIMARY_DARK, 0, 14, 12);
-        archiveButton.setContentDescription("선택 항목을 보관 폴더에 저장");
-        archiveButton.setOnClickListener(v -> saveSelectedToFolder());
+        deviceSendButton = new Button(this);
+        deviceSendButton.setText("기기 전송");
+        deviceSendButton.setContentDescription("선택 항목 기기로 전송");
+        styleActionButton(deviceSendButton, 0xffeef3ff, PRIMARY_DARK, 0, 14, 12);
+        deviceSendButton.setOnClickListener(v -> sendSelectedToDevice());
         deleteButton = new Button(this);
         deleteButton.setText("선택 삭제");
         styleActionButton(deleteButton, 0xfffff0f2, DANGER, 0, 14, 12);
@@ -282,23 +287,83 @@ public final class MainActivity extends Activity {
         shareParams.setMargins(0, 0, dp(2), 0);
         LinearLayout.LayoutParams copyParams = new LinearLayout.LayoutParams(0, dp(48), 1);
         copyParams.setMargins(dp(2), 0, dp(2), 0);
-        LinearLayout.LayoutParams archiveParams = new LinearLayout.LayoutParams(0, dp(48), 1);
-        archiveParams.setMargins(dp(2), 0, dp(2), 0);
         LinearLayout.LayoutParams clearParams = new LinearLayout.LayoutParams(0, dp(48), 1);
         clearParams.setMargins(dp(2), 0, 0, 0);
         actions.addView(shareButton, shareParams);
-        actions.addView(copyButton, copyParams);
-        actions.addView(archiveButton, archiveParams);
+        actions.addView(deviceSendButton, copyParams);
         actions.addView(deleteButton, clearParams);
         root.addView(actions, actionsParams);
         setContentView(root);
         render();
     }
 
-    private void startCapture() {
-        Intent capture = new Intent(this, CaptureActivity.class)
-            .putExtra(CaptureActivity.EXTRA_CAPTURE_ID, java.util.UUID.randomUUID() + ".jpg");
-        startActivity(capture);
+    private void setMacConnectionState(boolean connected, boolean checking) {
+        macConnectionDot.setBackground(roundedBackground(connected ? 0xff16a34a : 0xff98a2b3, Color.WHITE, 50));
+        macBridgeButton.setContentDescription(connected ? "기기 연결됨" : checking ? "기기 연결 확인 중" : "기기 연결 안 됨");
+    }
+
+    private void refreshMacConnection() {
+        connectionGeneration++;
+        connectionHandler.removeCallbacks(checkMacConnection);
+        if (!connectionCheckingActive) return;
+        setMacConnectionState(false, true);
+        connectionHandler.postDelayed(checkMacConnection, 150);
+    }
+
+    private void checkMacConnection() {
+        if (!connectionCheckingActive) return;
+        MacBridgeClient.Pairing pairing = MacBridgeClient.savedPairing(this);
+        if (!MacBridgeClient.isValidPairing(pairing)) {
+            setMacConnectionState(false, false);
+            return;
+        }
+        int generation = connectionGeneration;
+        new Thread(() -> {
+            boolean connected;
+            try {
+                MacBridgeClient.checkConnection(this, pairing);
+                connected = true;
+            } catch (IOException | RuntimeException error) {
+                connected = false;
+            }
+            boolean result = connected;
+            connectionHandler.post(() -> {
+                if (!connectionCheckingActive || generation != connectionGeneration) return;
+                if (result) {
+                    setMacConnectionState(true, false);
+                    connectionHandler.postDelayed(checkMacConnection, 30000);
+                } else {
+                    reconnectDiscoveredDevice(pairing, generation);
+                }
+            });
+        }).start();
+    }
+
+    private void reconnectDiscoveredDevice(MacBridgeClient.Pairing pairing, int generation) {
+        discoverWifiDevices(null, null, found -> {
+            if (!connectionCheckingActive || generation != connectionGeneration) return;
+            new Thread(() -> {
+                String verifiedHost = null;
+                for (String address : new HashSet<>(found.values())) {
+                    if (address.equals(pairing.host)) continue;
+                    try {
+                        MacBridgeClient.checkConnection(this, new MacBridgeClient.Pairing(address, pairing.token, pairing.certificatePin));
+                        verifiedHost = address;
+                        break;
+                    } catch (IOException | RuntimeException ignored) { }
+                }
+                String host = verifiedHost;
+                connectionHandler.post(() -> {
+                    if (!connectionCheckingActive || generation != connectionGeneration) return;
+                    if (host != null && StackStore.updateVerifiedHost(this, pairing, host)) {
+                        MacReceiveService.checkOnOpen(this);
+                    } else {
+                        setMacConnectionState(false, false);
+                        connectionHandler.postDelayed(checkMacConnection, 30000);
+                    }
+                });
+            }, "share-stack-reconnect").start();
+        });
     }
 
     private void showMacBridge() {
@@ -352,6 +417,7 @@ public final class MainActivity extends Activity {
         host.setHint("기기 Wi-Fi 또는 Tailscale IPv4");
         host.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI);
         host.setText(preferences.getString(MacBridgeClient.HOST, ""));
+        String[] shownHost = { host.getText().toString() };
         manual.addView(host, new LinearLayout.LayoutParams(-1, dp(48)));
 
         EditText token = new EditText(this);
@@ -370,6 +436,32 @@ public final class MainActivity extends Activity {
         certificatePin.setText(preferences.getString(MacBridgeClient.TLS_PIN, ""));
         manual.addView(certificatePin, new LinearLayout.LayoutParams(-1, dp(48)));
 
+        TextView selectedDevice = new TextView(this);
+        selectedDevice.setTextSize(14);
+        selectedDevice.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        selectedDevice.setTextColor(PRIMARY_DARK);
+        selectedDevice.setPadding(dp(14), dp(12), dp(14), dp(12));
+        selectedDevice.setBackground(roundedBackground(0xffeef3ff, 0xffcbdcff, 12));
+        LinearLayout.LayoutParams selectedParams = new LinearLayout.LayoutParams(-1, -2);
+        selectedParams.setMargins(0, dp(8), 0, dp(4));
+        panel.addView(selectedDevice, selectedParams);
+        Runnable updateSelectedDevice = () -> {
+            String address = host.getText().toString().trim();
+            boolean paired = MacBridgeClient.isValidPairing(new MacBridgeClient.Pairing(address,
+                token.getText().toString().trim(), certificatePin.getText().toString().trim()));
+            selectedDevice.setText(address.isEmpty() ? "선택한 기기 없음"
+                : "선택한 기기 · " + address + "\n" + (paired ? "✓ 연결 정보 준비됨" : "QR 코드 연결 필요"));
+        };
+        TextWatcher selectionWatcher = new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) { updateSelectedDevice.run(); }
+            @Override public void afterTextChanged(Editable s) { }
+        };
+        host.addTextChangedListener(selectionWatcher);
+        token.addTextChangedListener(selectionWatcher);
+        certificatePin.addTextChangedListener(selectionWatcher);
+        updateSelectedDevice.run();
+
         TextView status = new TextView(this);
         status.setText(preferences.getString(MacBridgeClient.RECEIVE_STATUS, "파일과 텍스트를 양방향으로 전송합니다."));
         status.setTextSize(12);
@@ -379,11 +471,15 @@ public final class MainActivity extends Activity {
         panel.addView(status, statusParams);
 
         CheckBox automatic = new CheckBox(this);
-        automatic.setText("자동 수신");
+        automatic.setText("Mac → Android 자동 수신");
         automatic.setChecked(preferences.getBoolean(MacBridgeClient.AUTO_RECEIVE, false));
         panel.addView(automatic);
         automatic.setOnClickListener(v -> {
-            if (!automatic.isChecked()) { MacReceiveService.stop(this); return; }
+            if (!automatic.isChecked()) {
+                preferences.edit().putBoolean(MacBridgeClient.AUTO_RECEIVE, false).apply();
+                MacReceiveService.start(this, null);
+                return;
+            }
             MacBridgeClient.Pairing pairing = saveMacPairing(host, token, certificatePin);
             if (!MacBridgeClient.isValidPairing(pairing)) {
                 automatic.setChecked(false);
@@ -399,8 +495,36 @@ public final class MainActivity extends Activity {
             preferences.edit().putBoolean(MacBridgeClient.AUTO_RECEIVE, true).apply();
             MacReceiveService.start(this, null);
         });
+        CheckBox automaticSend = new CheckBox(this);
+        automaticSend.setText("Android → Mac 자동 전송");
+        automaticSend.setChecked(preferences.getBoolean(MacBridgeClient.AUTO_SEND, false));
+        panel.addView(automaticSend);
+        automaticSend.setOnClickListener(v -> {
+            if (automaticSend.isChecked()) {
+                MacBridgeClient.Pairing pairing = saveMacPairing(host, token, certificatePin);
+                if (!MacBridgeClient.isValidPairing(pairing)) {
+                    automaticSend.setChecked(false);
+                    status.setText("먼저 기기의 QR 코드로 연결하세요.");
+                    return;
+                }
+                if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    automaticSend.setChecked(false);
+                    requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, BADGE_PERMISSION_REQUEST);
+                    status.setText("알림을 허용한 뒤 자동 전송을 켜세요.");
+                    return;
+                }
+            }
+            preferences.edit().putBoolean(MacBridgeClient.AUTO_SEND, automaticSend.isChecked()).apply();
+            MacReceiveService.start(this, null);
+        });
         SharedPreferences.OnSharedPreferenceChangeListener receiveListener = (prefs, key) -> runOnUiThread(() -> {
+            if (MacBridgeClient.HOST.equals(key)) {
+                String savedHost = prefs.getString(MacBridgeClient.HOST, "");
+                if (host.getText().toString().equals(shownHost[0])) host.setText(savedHost);
+                shownHost[0] = savedHost;
+            }
             automatic.setChecked(prefs.getBoolean(MacBridgeClient.AUTO_RECEIVE, false));
+            automaticSend.setChecked(prefs.getBoolean(MacBridgeClient.AUTO_SEND, false));
             if (MacBridgeClient.RECEIVE_STATUS.equals(key)) status.setText(prefs.getString(key, ""));
         });
         preferences.registerOnSharedPreferenceChangeListener(receiveListener);
@@ -464,23 +588,58 @@ public final class MainActivity extends Activity {
     }
 
     private void discoverMacOnWifi(EditText hostField, EditText tokenField, EditText pinField, TextView status, Button button) {
+        discoverWifiDevices(status, button, found -> {
+            ArrayList<String> labels = new ArrayList<>(found.keySet());
+            ArrayList<String> addresses = new ArrayList<>(found.values());
+            if (addresses.isEmpty()) {
+                status.setText("기기를 찾지 못했습니다. 같은 Wi-Fi인지 확인하세요.");
+                return;
+            }
+            new AlertDialog.Builder(this)
+                .setTitle("연결할 기기 선택")
+                .setSingleChoiceItems(labels.toArray(new String[0]), addresses.indexOf(hostField.getText().toString().trim()), (dialog, which) -> {
+                    String address = addresses.get(which);
+                    if (!address.equals(hostField.getText().toString().trim())) {
+                        tokenField.setText("");
+                        pinField.setText("");
+                    }
+                    hostField.setText(address);
+                    status.setText(MacBridgeClient.isValidPairing(new MacBridgeClient.Pairing(address,
+                        tokenField.getText().toString().trim(), pinField.getText().toString().trim()))
+                        ? "기기가 검색되었고 연결 정보가 준비되어 있습니다." : "기기를 찾았습니다. 기기의 QR 코드를 스캔해 연결하세요.");
+                    dialog.dismiss();
+                })
+                .setNegativeButton("취소", null)
+                .show();
+        });
+    }
+
+    private void discoverWifiDevices(TextView status, Button button, java.util.function.Consumer<Map<String, String>> completed) {
+        if (wifiDiscoveryInProgress) {
+            if (status != null) status.setText("기기 검색이 진행 중입니다. 잠시 후 다시 시도하세요.");
+            else completed.accept(java.util.Collections.emptyMap());
+            return;
+        }
         NsdManager manager = (NsdManager) getSystemService(Context.NSD_SERVICE);
         WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (manager == null || wifi == null) {
-            status.setText("Wi-Fi 기기 검색을 사용할 수 없습니다.");
+            if (status != null) status.setText("Wi-Fi 기기 검색을 사용할 수 없습니다.");
+            completed.accept(java.util.Collections.emptyMap());
             return;
         }
-        button.setEnabled(false);
+        if (button != null) button.setEnabled(false);
         WifiManager.MulticastLock multicastLock = wifi.createMulticastLock("share-stack-discovery");
         multicastLock.setReferenceCounted(false);
         try {
             multicastLock.acquire();
         } catch (RuntimeException exception) {
-            status.setText("Wi-Fi 기기 검색 권한이 필요합니다.");
-            button.setEnabled(true);
+            if (status != null) status.setText("Wi-Fi 기기 검색 권한이 필요합니다.");
+            if (button != null) button.setEnabled(true);
+            completed.accept(java.util.Collections.emptyMap());
             return;
         }
 
+        wifiDiscoveryInProgress = true;
         Handler handler = new Handler(Looper.getMainLooper());
         Map<String, String> found = new LinkedHashMap<>();
         boolean[] finished = { false };
@@ -517,7 +676,7 @@ public final class MainActivity extends Activity {
         Runnable[] finishHolder = new Runnable[1];
         NsdManager.DiscoveryListener listener = new NsdManager.DiscoveryListener() {
             @Override public void onDiscoveryStarted(String serviceType) {
-                handler.post(() -> status.setText("같은 Wi-Fi에서 기기 검색 중…"));
+                if (status != null) handler.post(() -> status.setText("같은 Wi-Fi에서 기기 검색 중…"));
             }
 
             @Override public void onServiceFound(NsdServiceInfo service) {
@@ -540,39 +699,16 @@ public final class MainActivity extends Activity {
                 manager.stopServiceDiscovery(listenerHolder[0]);
             } catch (IllegalArgumentException ignored) { }
             if (multicastLock.isHeld()) multicastLock.release();
-            button.setEnabled(true);
-            ArrayList<String> labels;
-            ArrayList<String> addresses;
-            synchronized (found) {
-                labels = new ArrayList<>(found.keySet());
-                addresses = new ArrayList<>(found.values());
-            }
-            if (addresses.isEmpty()) {
-                status.setText("기기를 찾지 못했습니다. 같은 Wi-Fi인지 확인하세요.");
-                return;
-            }
-            new AlertDialog.Builder(this)
-                .setTitle("연결할 기기 선택")
-                .setItems(labels.toArray(new String[0]), (dialog, which) -> {
-                    String address = addresses.get(which);
-                    if (!address.equals(hostField.getText().toString().trim())) {
-                        tokenField.setText("");
-                        pinField.setText("");
-                    }
-                    hostField.setText(address);
-                    status.setText(MacBridgeClient.isValidPairing(new MacBridgeClient.Pairing(address,
-                        tokenField.getText().toString().trim(), pinField.getText().toString().trim()))
-                        ? "연결된 기기를 선택했습니다." : "기기를 찾았습니다. 기기의 QR 코드를 스캔해 연결하세요.");
-                })
-                .setNegativeButton("취소", null)
-                .show();
+            wifiDiscoveryInProgress = false;
+            if (button != null) button.setEnabled(true);
+            completed.accept(found);
         };
         try {
             manager.discoverServices("_sharestack._tcp.", NsdManager.PROTOCOL_DNS_SD, listener);
             handler.postDelayed(finishHolder[0], 6000);
         } catch (RuntimeException exception) {
             finishHolder[0].run();
-            status.setText("기기 검색을 시작하지 못했습니다.");
+            if (status != null) status.setText("기기 검색을 시작하지 못했습니다.");
         }
     }
 
@@ -820,13 +956,6 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams expiryParams = new LinearLayout.LayoutParams(-1, dp(44));
         expiryParams.setMargins(0, 0, 0, 0);
         panel.addView(expiry, expiryParams);
-        addSettingsDivider(panel);
-        archiveFolderSettingButton = new Button(this);
-        stylePlainSettingsButton(archiveFolderSettingButton);
-        updateArchiveFolderButton(archiveFolderSettingButton);
-        archiveFolderSettingButton.setOnClickListener(view -> chooseArchiveFolder(null));
-        panel.addView(archiveFolderSettingButton,
-            new LinearLayout.LayoutParams(-1, dp(44)));
         LinearLayout buttons = new LinearLayout(this);
         buttons.setGravity(Gravity.CENTER_VERTICAL);
         buttons.setPadding(0, dp(14), 0, 0);
@@ -878,149 +1007,6 @@ public final class MainActivity extends Activity {
 
     private void updateViewModeButton(Button button, String mode) {
         button.setText(LIST_MODE.equals(mode) ? "보기 방식 · 목록형" : "보기 방식 · 썸네일형");
-    }
-
-    private void updateArchiveFolderButton(Button button) {
-        String folderName = getSharedPreferences(PREFS, MODE_PRIVATE)
-            .getString(ARCHIVE_FOLDER_NAME, null);
-        button.setText(folderName == null || folderName.isEmpty()
-            ? "보관 폴더 지정" : "보관 폴더 · " + folderName);
-        button.setSingleLine(true);
-        button.setEllipsize(TextUtils.TruncateAt.END);
-    }
-
-    private void saveSelectedToFolder() {
-        List<StackItem> chosen = selected();
-        if (chosen.isEmpty()) {
-            toast("보관할 항목을 선택하세요");
-            return;
-        }
-        String savedUri = getSharedPreferences(PREFS, MODE_PRIVATE)
-            .getString(ARCHIVE_FOLDER_URI, null);
-        if (savedUri == null || savedUri.isEmpty()) {
-            ArrayList<String> itemIds = new ArrayList<>();
-            for (StackItem item : chosen) itemIds.add(item.id);
-            chooseArchiveFolder(itemIds);
-            return;
-        }
-        archiveItems(chosen, Uri.parse(savedUri));
-    }
-
-    private void chooseArchiveFolder(ArrayList<String> itemIds) {
-        pendingArchiveItemIds = itemIds == null ? null : new ArrayList<>(itemIds);
-        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
-                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-        try {
-            startActivityForResult(picker, ARCHIVE_FOLDER_REQUEST);
-        } catch (ActivityNotFoundException | SecurityException exception) {
-            pendingArchiveItemIds = null;
-            toast("폴더 선택 화면을 열 수 없습니다");
-        }
-    }
-
-    private String archiveFolderName(Uri treeUri) {
-        String documentId = DocumentsContract.getTreeDocumentId(treeUri);
-        if (documentId == null || documentId.isEmpty()) return "선택됨";
-        int separator = Math.max(documentId.lastIndexOf('/'), documentId.lastIndexOf(':'));
-        String name = documentId.substring(separator + 1).trim();
-        return name.isEmpty() ? "선택됨" : name;
-    }
-
-    private void archiveItems(List<StackItem> selectedItems, Uri treeUri) {
-        if (archivingItems || selectedItems.isEmpty()) return;
-        archivingItems = true;
-        updateSelectionState();
-        toast("선택한 항목을 폴더에 보관합니다");
-        ArrayList<StackItem> snapshot = new ArrayList<>(selectedItems);
-        new Thread(() -> {
-            Set<String> existingNames = existingArchiveNames(treeUri);
-            int saved = 0;
-            int failed = 0;
-            for (StackItem item : snapshot) {
-                Uri createdDocument = null;
-                try {
-                    String fileName = uniqueArchiveName(archiveFileName(item), existingNames);
-                    String mimeType = item.mimeType == null || item.mimeType.isEmpty()
-                        ? "application/octet-stream" : item.mimeType;
-                    createdDocument = DocumentsContract.createDocument(
-                        getContentResolver(), treeUri, mimeType, fileName);
-                    if (createdDocument == null) throw new IOException("Document provider returned no URI");
-                    try (InputStream input = new FileInputStream(itemFile(item.id));
-                         OutputStream output = getContentResolver().openOutputStream(createdDocument, "w")) {
-                        if (output == null) throw new IOException("Document provider returned no output stream");
-                        byte[] buffer = new byte[8192];
-                        int count;
-                        while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
-                    }
-                    saved++;
-                } catch (Exception exception) {
-                    if (createdDocument != null) {
-                        try {
-                            DocumentsContract.deleteDocument(getContentResolver(), createdDocument);
-                        } catch (Exception ignored) { }
-                    }
-                    failed++;
-                }
-            }
-            int savedCount = saved;
-            int failedCount = failed;
-            runOnUiThread(() -> {
-                archivingItems = false;
-                updateSelectionState();
-                toast(savedCount + "개 보관 완료" + (failedCount == 0 ? "" : ", " + failedCount + "개 실패"));
-            });
-        }, "share-stack-folder-archive").start();
-    }
-
-    private Set<String> existingArchiveNames(Uri treeUri) {
-        HashSet<String> names = new HashSet<>();
-        try {
-            Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
-                treeUri, DocumentsContract.getTreeDocumentId(treeUri));
-            try (Cursor cursor = getContentResolver().query(childrenUri,
-                new String[] {DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null)) {
-                if (cursor != null) {
-                    int nameColumn = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
-                    while (nameColumn >= 0 && cursor.moveToNext()) {
-                        String name = cursor.getString(nameColumn);
-                        if (name != null) names.add(name.toLowerCase(Locale.ROOT));
-                    }
-                }
-            }
-        } catch (Exception ignored) {
-            // ponytail: some document providers cannot list children; use provider create semantics for collisions.
-        }
-        return names;
-    }
-
-    private String archiveFileName(StackItem item) {
-        String name;
-        if ("text/plain".equals(item.mimeType)) {
-            String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
-                .format(new Date(item.createdAt));
-            name = "텍스트_" + timestamp + ".txt";
-        } else {
-            name = item.name == null ? "파일" : item.name;
-        }
-        name = name.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_").trim();
-        while (name.endsWith(".")) name = name.substring(0, name.length() - 1).trim();
-        return name.isEmpty() ? "파일" : name;
-    }
-
-    private String uniqueArchiveName(String originalName, Set<String> existingNames) {
-        int extensionIndex = originalName.lastIndexOf('.');
-        if (extensionIndex <= 0) extensionIndex = originalName.length();
-        String base = originalName.substring(0, extensionIndex);
-        String extension = originalName.substring(extensionIndex);
-        String candidate = originalName;
-        int suffix = 1;
-        while (existingNames.contains(candidate.toLowerCase(Locale.ROOT))) {
-            candidate = base + " (" + suffix++ + ")" + extension;
-        }
-        existingNames.add(candidate.toLowerCase(Locale.ROOT));
-        return candidate;
     }
 
     @SuppressWarnings("deprecation")
@@ -1133,6 +1119,12 @@ public final class MainActivity extends Activity {
             updateStackBadge();
             return;
         }
+        TextView aiGuide = new TextView(this);
+        aiGuide.setText("체크한 파일만 AI가 읽을 수 있습니다.");
+        aiGuide.setTextSize(12);
+        aiGuide.setTextColor(MUTED);
+        aiGuide.setPadding(0, 0, 0, dp(8));
+        list.addView(aiGuide);
         if (isListMode()) {
             for (StackItem item : items) addListItem(item);
         } else {
@@ -1167,7 +1159,7 @@ public final class MainActivity extends Activity {
 
     private void addItemCard(LinearLayout row, StackItem item, boolean firstInRow) {
         FrameLayout card = new FrameLayout(this);
-        card.setBackground(roundedBackground(SURFACE, BORDER, 18));
+        applyAIReadBackground(card, item, 18);
         card.setElevation(dp(2));
         card.setClipToOutline(true);
 
@@ -1191,7 +1183,7 @@ public final class MainActivity extends Activity {
         details.setOrientation(LinearLayout.VERTICAL);
         details.setGravity(Gravity.CENTER_VERTICAL);
         details.setPadding(dp(10), dp(4), dp(10), dp(4));
-        details.setBackgroundColor(0xa0ffffff);
+        details.setBackgroundColor(0xe0ffffff);
         TextView name = new TextView(this);
         name.setText(item.name);
         name.setTextSize(14);
@@ -1201,8 +1193,8 @@ public final class MainActivity extends Activity {
         name.setSingleLine(true);
         name.setEllipsize(TextUtils.TruncateAt.END);
         applyLockIndicator(name, item);
-        details.addView(name);
-        card.addView(details, new FrameLayout.LayoutParams(-1, dp(44), Gravity.BOTTOM));
+        details.addView(aiReadNameRow(item, name));
+        card.addView(details, new FrameLayout.LayoutParams(-1, dp(48), Gravity.BOTTOM));
         card.setOnClickListener(v -> box.setChecked(!box.isChecked()));
         enableReorder(card, item);
 
@@ -1213,7 +1205,7 @@ public final class MainActivity extends Activity {
 
     private void addCompactGridItem(StackItem item) {
         FrameLayout compact = new FrameLayout(this);
-        compact.setBackground(roundedBackground(SURFACE, BORDER, 14));
+        applyAIReadBackground(compact, item, 14);
         compact.setElevation(dp(1));
         TextView name = new TextView(this);
         name.setText(item.name);
@@ -1225,7 +1217,10 @@ public final class MainActivity extends Activity {
         name.setGravity(Gravity.CENTER_VERTICAL);
         name.setPadding(dp(14), 0, dp(48), 0);
         applyLockIndicator(name, item);
-        compact.addView(name, new FrameLayout.LayoutParams(-1, -1));
+        FrameLayout.LayoutParams nameParams = new FrameLayout.LayoutParams(-1, -1);
+        nameParams.setMargins(dp(10), 0, dp(48), 0);
+        name.setPadding(0, 0, 0, 0);
+        compact.addView(aiReadNameRow(item, name), nameParams);
         CheckBox box = newSelectionBox(item);
         compact.addView(box, new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER_VERTICAL | Gravity.END));
         compact.setOnClickListener(v -> box.setChecked(!box.isChecked()));
@@ -1238,7 +1233,7 @@ public final class MainActivity extends Activity {
     private void addListItem(StackItem item) {
         FrameLayout card = new FrameLayout(this);
         card.setPadding(dp(8), dp(8), dp(12), dp(8));
-        card.setBackground(roundedBackground(SURFACE, BORDER, 18));
+        applyAIReadBackground(card, item, 18);
         card.setElevation(dp(2));
 
         LinearLayout content = new LinearLayout(this);
@@ -1251,7 +1246,7 @@ public final class MainActivity extends Activity {
         preview.setOnClickListener(v -> showItemDetails(item));
         previewArea.addView(preview, new FrameLayout.LayoutParams(-1, -1));
         CheckBox box = newSelectionBox(item);
-        content.addView(previewArea, new LinearLayout.LayoutParams(dp(108), dp(76)));
+        content.addView(previewArea, new LinearLayout.LayoutParams(dp(72), dp(76)));
 
         LinearLayout details = new LinearLayout(this);
         details.setOrientation(LinearLayout.VERTICAL);
@@ -1270,7 +1265,7 @@ public final class MainActivity extends Activity {
         type.setTextSize(13);
         type.setTextColor(MUTED);
         type.setPadding(0, dp(4), 0, 0);
-        details.addView(name);
+        details.addView(aiReadNameRow(item, name));
         details.addView(type);
         content.addView(details, new LinearLayout.LayoutParams(0, -1, 1));
         card.addView(content, new FrameLayout.LayoutParams(-1, -1));
@@ -1283,6 +1278,53 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(92));
         params.setMargins(0, 0, 0, dp(10));
         list.addView(card, params);
+    }
+
+    private LinearLayout aiReadNameRow(StackItem item, TextView name) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
+        AIReadIntent intent = AIReadSync.get(this, item.id);
+        CheckBox ai = new CheckBox(this);
+        ai.setTextSize(10);
+        ai.setTextColor(MUTED);
+        ai.setMinHeight(dp(48));
+        ai.setPadding(0, 0, 0, 0);
+        ai.setButtonTintList(ColorStateList.valueOf(PRIMARY));
+        ai.setChecked(intent != null && intent.allowed);
+        String status = intent == null ? "" : intent.status().replace("AI 읽기 ", "").replace(" · 재시도 대기", " · 재시도").replace("동기화 대기", "대기");
+        ai.setText(intent == null ? "AI 허용" : "AI 허용\n" + status);
+        ai.setMaxLines(2);
+        ai.setEllipsize(TextUtils.TruncateAt.END);
+        ai.setContentDescription(item.name + " · AI 읽기 허용" + (intent == null ? "" : " · " + intent.status() + " · " + intent.error));
+        row.addView(ai, new LinearLayout.LayoutParams(dp(100), dp(48)));
+        ai.setOnCheckedChangeListener((button, checked) -> {
+            try {
+                AIReadSync.choose(this, item.id, checked);
+                MacReceiveService.syncAI(this);
+            } catch (Exception error) { toast(error.getMessage()); }
+            render();
+        });
+        return row;
+    }
+
+    private void applyAIReadBackground(FrameLayout card, StackItem item, int radius) {
+        android.graphics.drawable.Drawable base = roundedBackground(SURFACE, BORDER, radius);
+        AIReadIntent intent = AIReadSync.get(this, item.id);
+        if (intent != null && intent.allowed && intent.pending()) {
+            android.graphics.drawable.ClipDrawable fill = new android.graphics.drawable.ClipDrawable(
+                roundedBackground(0xffe8f0ff, 0, radius), Gravity.START, android.graphics.drawable.ClipDrawable.HORIZONTAL);
+            android.graphics.drawable.LayerDrawable layers = new android.graphics.drawable.LayerDrawable(
+                new android.graphics.drawable.Drawable[]{base, fill});
+            card.setBackground(layers);
+            fill.setLevel(Math.max(300, intent.progress * 100));
+            if (isThumbnailCapable(item) && !isListMode()) {
+                android.graphics.drawable.ClipDrawable overlay = new android.graphics.drawable.ClipDrawable(
+                    roundedBackground(0x402563eb, 0, radius), Gravity.START, android.graphics.drawable.ClipDrawable.HORIZONTAL);
+                card.setForeground(overlay);
+                overlay.setLevel(Math.max(300, intent.progress * 100));
+            }
+        } else { card.setBackground(base); card.setForeground(null); }
     }
 
     private CheckBox newSelectionBox(StackItem item) {
@@ -1721,10 +1763,6 @@ public final class MainActivity extends Activity {
     private void updateSelectionState() {
         int selectedCount = 0;
         for (StackItem item : items) if (isItemSelected(item)) selectedCount++;
-        if (selectionSummary != null) {
-            selectionSummary.setText(selectedCount == 0 ? items.size() + "개" : selectedCount + "개 선택됨");
-            selectionSummary.setTextColor(PRIMARY_DARK);
-        }
         if (selectionToggleButton != null) {
             boolean hasItems = !items.isEmpty();
             boolean allSelected = hasItems && selectedCount == items.size();
@@ -1747,28 +1785,12 @@ public final class MainActivity extends Activity {
             styleActionButton(deleteButton, canDelete ? 0xfffff0f2 : 0xfff7eef0, canDelete ? DANGER : 0xff99636f, 0, 14, 12);
             deleteButton.setAlpha(1f);
         }
-        if (copyButton != null) {
-            boolean hasSelectedText = false;
-            boolean hasSelectedFile = false;
-            for (StackItem item : items) {
-                if (isItemSelected(item)) {
-                    if (!"text/plain".equals(item.mimeType)) hasSelectedFile = true;
-                    if ("text/plain".equals(item.mimeType)) hasSelectedText = true;
-                }
-            }
-            boolean canCopy = hasSelectedFile || hasSelectedText;
-            copyButton.setEnabled(canCopy);
-            copyButton.setText(hasSelectedFile ? "파일 복사" : "텍스트 복사");
-            styleActionButton(copyButton, canCopy ? 0xffeef3ff : 0xffeff2f6, canCopy ? PRIMARY_DARK : 0xff66758d, 0, 14, 12);
-            copyButton.setAlpha(1f);
-        }
-        if (archiveButton != null) {
-            boolean canArchive = selectedCount > 0 && !archivingItems;
-            archiveButton.setEnabled(canArchive);
-            archiveButton.setText(archivingItems ? "저장 중" : "보관");
-            styleActionButton(archiveButton, canArchive ? 0xffeef3ff : 0xffeff2f6,
-                canArchive ? PRIMARY_DARK : 0xff66758d, 0, 14, 12);
-            archiveButton.setContentDescription("선택 항목을 보관 폴더에 저장");
+        if (deviceSendButton != null) {
+            boolean canSend = selectedCount > 0 && !deviceSending;
+            deviceSendButton.setEnabled(canSend);
+            deviceSendButton.setText(deviceSending ? "전송 중" : "기기 전송");
+            styleActionButton(deviceSendButton, canSend ? 0xffeef3ff : 0xffeff2f6,
+                canSend ? PRIMARY_DARK : 0xff66758d, 0, 14, 12);
         }
     }
 
@@ -1782,45 +1804,6 @@ public final class MainActivity extends Activity {
             requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, BADGE_PERMISSION_REQUEST);
         } else {
             updateStackBadge();
-        }
-    }
-
-    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != ARCHIVE_FOLDER_REQUEST) return;
-        ArrayList<String> itemIdsToArchive = pendingArchiveItemIds;
-        pendingArchiveItemIds = null;
-        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
-
-        Uri treeUri = data.getData();
-        int grantFlags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION
-            | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-        if ((grantFlags & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) == 0) {
-            toast("선택한 폴더에 쓸 권한이 없습니다");
-            return;
-        }
-        try {
-            getContentResolver().takePersistableUriPermission(treeUri, grantFlags);
-        } catch (SecurityException exception) {
-            toast("폴더 접근 권한을 저장할 수 없습니다");
-            return;
-        }
-
-        String folderName = archiveFolderName(treeUri);
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putString(ARCHIVE_FOLDER_URI, treeUri.toString())
-            .putString(ARCHIVE_FOLDER_NAME, folderName)
-            .apply();
-        if (archiveFolderSettingButton != null) {
-            updateArchiveFolderButton(archiveFolderSettingButton);
-        }
-        if (itemIdsToArchive != null && !itemIdsToArchive.isEmpty()) {
-            ArrayList<StackItem> chosen = new ArrayList<>();
-            for (StackItem item : items) {
-                if (itemIdsToArchive.contains(item.id)) chosen.add(item);
-            }
-            if (chosen.isEmpty()) toast("보관할 스택 항목을 찾을 수 없습니다");
-            else archiveItems(chosen, treeUri);
         }
     }
 
@@ -1852,6 +1835,27 @@ public final class MainActivity extends Activity {
         return selectedItemIds.contains(item.id);
     }
 
+    private void sendSelectedToDevice() {
+        MacBridgeClient.Pairing pairing = MacBridgeClient.savedPairing(this);
+        if (!MacBridgeClient.isValidPairing(pairing)) {
+            toast("먼저 기기를 연결하세요");
+            showMacBridge();
+            return;
+        }
+        ArrayList<StackItem> chosen = new ArrayList<>(selected());
+        if (chosen.isEmpty() || deviceSending) return;
+        deviceSending = true;
+        render();
+        new Thread(() -> {
+            try {
+                int count = MacBridgeClient.send(this, pairing, chosen);
+                runOnUiThread(() -> { deviceSending = false; render(); toast(count + "개 항목을 기기로 보냈습니다"); });
+            } catch (Exception error) {
+                runOnUiThread(() -> { deviceSending = false; render(); toast("전송 실패: " + error.getMessage()); });
+            }
+        }, "share-stack-device-send").start();
+    }
+
     private void shareSelected() {
         List<StackItem> selected = selected();
         if (selected.isEmpty()) { toast("공유할 항목을 선택하세요"); return; }
@@ -1863,7 +1867,7 @@ public final class MainActivity extends Activity {
             new AlertDialog.Builder(this)
                 .setTitle("공유 방식")
                 .setMessage(hasText
-                    ? "파일은 공유 화면으로 보내고 텍스트는 클립보드에 복사합니다. 대상 앱이 여러 파일을 받지 못하면 ZIP으로 공유하세요."
+                    ? "파일과 텍스트를 공유 화면으로 보냅니다. 대상 앱이 여러 파일을 받지 못하면 ZIP으로 공유하세요."
                     : "한번에 공유가 권장됩니다. 대상 앱이 여러 파일을 받지 못하면 ZIP으로 공유하세요.")
                 .setPositiveButton("한번에 공유", (dialog, which) -> shareItems(selected, false))
                 .setNeutralButton("ZIP으로 공유", (dialog, which) -> shareItems(selected, true))
@@ -1916,27 +1920,20 @@ public final class MainActivity extends Activity {
     }
 
     private void launchShare(PreparedShare payload) {
-        if (payload.uris.isEmpty()) {
-            if (payload.text.isEmpty()) { toast("공유할 내용을 찾을 수 없습니다"); return; }
-            copyTextToClipboard(payload.text);
-            toast("텍스트를 클립보드에 복사했습니다");
-            if (payload.clearAfterShare) clearUnlockedStack();
-            return;
-        }
+        if (payload.uris.isEmpty() && payload.text.isEmpty()) { toast("공유할 내용을 찾을 수 없습니다"); return; }
         Intent send = new Intent(payload.uris.size() <= 1 ? Intent.ACTION_SEND : Intent.ACTION_SEND_MULTIPLE);
         send.setType(payload.sendType);
-        ClipData clipData = ClipData.newRawUri("Share Stack items", payload.uris.get(0));
-        for (int index = 1; index < payload.uris.size(); index++) {
-            clipData.addItem(new ClipData.Item(payload.uris.get(index)));
+        if (!payload.uris.isEmpty()) {
+            ClipData clipData = ClipData.newRawUri("Share Stack items", payload.uris.get(0));
+            for (int index = 1; index < payload.uris.size(); index++) {
+                clipData.addItem(new ClipData.Item(payload.uris.get(index)));
+            }
+            send.setClipData(clipData);
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         }
-        send.setClipData(clipData);
-        send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         if (payload.uris.size() == 1) send.putExtra(Intent.EXTRA_STREAM, payload.uris.get(0));
-        else send.putParcelableArrayListExtra(Intent.EXTRA_STREAM, payload.uris);
-        if (!payload.text.isEmpty()) {
-            copyTextToClipboard(payload.text);
-            toast("텍스트를 복사했습니다. 대상 앱에서 붙여넣으세요.");
-        }
+        else if (!payload.uris.isEmpty()) send.putParcelableArrayListExtra(Intent.EXTRA_STREAM, payload.uris);
+        if (!payload.text.isEmpty()) send.putExtra(Intent.EXTRA_TEXT, payload.text);
         Intent chooser = payload.clearAfterShare
             ? Intent.createChooser(send, "선택 항목 공유", ShareSelectionReceiver.forItems(this, payload.selected))
             : Intent.createChooser(send, "선택 항목 공유");
@@ -1979,39 +1976,6 @@ public final class MainActivity extends Activity {
         return type;
     }
 
-    private void copySelectedContent() {
-        List<StackItem> selected = selected();
-        ArrayList<StackItem> files = new ArrayList<>();
-        for (StackItem item : selected) if (!"text/plain".equals(item.mimeType)) files.add(item);
-        if (!files.isEmpty()) {
-            copyFilesToClipboard(files);
-            return;
-        }
-        String text = selectedText(selected);
-        if (text.isEmpty()) { toast("선택한 항목에 텍스트가 없습니다"); return; }
-        copyTextToClipboard(text);
-        toast("텍스트를 클립보드에 복사했습니다");
-    }
-
-    private void copyFilesToClipboard(List<StackItem> files) {
-        StackItem first = files.get(0);
-        Uri firstUri = contentUri("", first.id, first.name, first.mimeType);
-        ClipData clip = new ClipData("Share Stack files",
-            new String[]{commonType(files)}, new ClipData.Item(firstUri));
-        for (int index = 1; index < files.size(); index++) {
-            StackItem file = files.get(index);
-            clip.addItem(getContentResolver(), new ClipData.Item(
-                contentUri("", file.id, file.name, file.mimeType)));
-        }
-        ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(clip);
-        toast(files.size() + "개의 파일을 클립보드에 복사했습니다");
-    }
-
-    private void copyTextToClipboard(String text) {
-        ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE))
-            .setPrimaryClip(ClipData.newPlainText("Share Stack", text));
-    }
-
     private String selectedText(List<StackItem> selected) {
         StringBuilder text = new StringBuilder();
         for (StackItem item : selected) if ("text/plain".equals(item.mimeType)) {
@@ -2035,13 +1999,6 @@ public final class MainActivity extends Activity {
     private void clearSelected() {
         List<StackItem> selected = selected(); if (selected.isEmpty()) return;
         for (StackItem item : selected) new File(getFilesDir(), "items/" + item.id).delete(); items.removeAll(selected); saveItems(); render();
-    }
-
-    private void clearUnlockedStack() {
-        StackStore.removeUnlocked(this);
-        items.clear();
-        loadItems();
-        render();
     }
 
     private String copyForSharing(StackItem item) throws IOException {

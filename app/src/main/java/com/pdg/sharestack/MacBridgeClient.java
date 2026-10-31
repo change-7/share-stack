@@ -11,11 +11,16 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.ConnectException;
 import java.net.HttpURLConnection;
+import java.net.NoRouteToHostException;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -26,6 +31,8 @@ import java.util.List;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Set;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLPeerUnverifiedException;
@@ -38,9 +45,16 @@ final class MacBridgeClient {
     static final String TOKEN = "mac_bridge_token";
     static final String TLS_PIN = "mac_bridge_tls_pin";
     static final String AUTO_RECEIVE = "mac_bridge_auto_receive";
+    static final String AUTO_SEND = "mac_bridge_auto_send";
     static final String RECEIVE_STATUS = "mac_bridge_receive_status";
     static final int PORT = 8765;
     private static final int CHUNK_SIZE = 8 * 1024 * 1024;
+    private static final int MAX_RETRIES = 3;
+    private static final Object[] UPLOAD_LOCKS = new Object[16];
+
+    static {
+        for (int index = 0; index < UPLOAD_LOCKS.length; index++) UPLOAD_LOCKS[index] = new Object();
+    }
 
     private MacBridgeClient() { }
 
@@ -76,85 +90,163 @@ final class MacBridgeClient {
     }
 
     static int send(Context context, Pairing pairing, List<StackItem> items) throws IOException {
-        pairing = validate(context, pairing);
+        Pairing validated = validate(context, pairing);
         int sent = 0;
         for (StackItem item : items) {
-            File file = StackStore.itemFile(context, item.id);
-            if (!file.isFile()) throw new IOException("스택 파일을 찾을 수 없습니다: " + item.name);
-            if (file.length() > StackStore.MAXIMUM_TRANSFER_SIZE) throw new IOException("최대 전송 크기는 20 GiB입니다");
-            String sha256 = StackStore.fingerprint(file);
-            HttpURLConnection begin = open(pairing, "/v1/uploads");
-            begin.setRequestMethod("POST");
-            begin.setDoOutput(true);
-            begin.setFixedLengthStreamingMode(0);
-            begin.setRequestProperty("X-Upload-ID", sha256);
-            begin.setRequestProperty("X-Item-Name", encodeHeader(item.name));
-            begin.setRequestProperty("X-Item-Mime", encodeHeader(item.mimeType));
-            begin.setRequestProperty("X-Item-Size", Long.toString(file.length()));
-            begin.setRequestProperty("X-Item-SHA256", sha256);
-            JSONObject upload;
-            try {
-                begin.getOutputStream().close();
-                requireSuccess(begin);
-                try (InputStream input = begin.getInputStream()) {
-                    upload = new JSONObject(new String(readAll(input), StandardCharsets.UTF_8));
-                } catch (org.json.JSONException exception) {
-                    throw new IOException("Mac 업로드 응답을 읽을 수 없습니다", exception);
-                }
-            } finally {
-                begin.disconnect();
-            }
-            if (!upload.optBoolean("complete")) {
-                long offset = upload.optLong("offset", -1);
-                if (offset < 0 || offset > file.length()) throw new IOException("Mac 업로드 위치가 올바르지 않습니다");
-                while (offset < file.length()) {
-                    int length = (int) Math.min(CHUNK_SIZE, file.length() - offset);
-                    byte[] chunk = new byte[length];
-                    try (java.io.RandomAccessFile source = new java.io.RandomAccessFile(file, "r")) {
-                        source.seek(offset);
-                        source.readFully(chunk);
-                    }
-                    HttpURLConnection connection = open(pairing, "/v1/uploads/" + sha256);
-                    connection.setRequestMethod("PUT");
-                    connection.setDoOutput(true);
-                    connection.setFixedLengthStreamingMode(length);
-                    connection.setRequestProperty("Content-Type", "application/octet-stream");
-                    connection.setRequestProperty("Content-Range", "bytes " + offset + "-" + (offset + length - 1) + "/" + file.length());
-                    try {
-                        try (OutputStream output = connection.getOutputStream()) { output.write(chunk); }
-                        requireSuccess(connection);
-                        try (InputStream input = connection.getInputStream()) {
-                            JSONObject response = new JSONObject(new String(readAll(input), StandardCharsets.UTF_8));
-                            long next = response.optLong("offset", -1);
-                            if (next != offset + length) throw new IOException("Mac 업로드 위치가 맞지 않습니다");
-                            offset = next;
-                        } catch (org.json.JSONException exception) {
-                            throw new IOException("Mac 업로드 응답을 읽을 수 없습니다", exception);
-                        }
-                    } finally {
-                        connection.disconnect();
-                    }
-                }
-                HttpURLConnection finish = open(pairing, "/v1/uploads/" + sha256 + "/finish");
-                finish.setRequestMethod("POST");
-                finish.setDoOutput(true);
-                finish.setFixedLengthStreamingMode(0);
-                try {
-                    finish.getOutputStream().close();
-                    requireSuccess(finish);
-                } finally {
-                    finish.disconnect();
-                }
-            }
+            upload(context, validated, item, null);
             sent++;
         }
         return sent;
+    }
+
+    static JSONObject upload(Context context, Pairing validated, StackItem item, ReceiveControl control) throws IOException {
+        File file = StackStore.itemFile(context, item.id);
+        if (!file.isFile()) throw new IOException("스택 파일을 찾을 수 없습니다: " + item.name);
+        if (file.length() > StackStore.MAXIMUM_TRANSFER_SIZE) throw new IOException("최대 전송 크기는 20 GiB입니다");
+        String sha256 = StackStore.fingerprint(file, () -> control != null && control.cancelled());
+        long fileLength = file.length();
+        synchronized (UPLOAD_LOCKS[sha256.hashCode() & (UPLOAD_LOCKS.length - 1)]) {
+            byte[] buffer = new byte[64 * 1024];
+            try (java.io.RandomAccessFile source = new java.io.RandomAccessFile(file, "r")) {
+                JSONObject upload = retry(() -> beginUpload(validated, item, fileLength, sha256, control), control);
+                boolean complete = upload.optBoolean("complete");
+                long offset = upload.optLong("offset", -1);
+                if (offset < 0 || offset > fileLength) throw new IOException("Mac 업로드 위치가 올바르지 않습니다");
+                while (!complete && offset < fileLength) {
+                    int retries = 0;
+                    while (true) {
+                        checkCancelled(control);
+                        int length = (int) Math.min(CHUNK_SIZE, fileLength - offset);
+                        try {
+                            long start = offset;
+                            long next = sendUploadChunk(validated, sha256, source, buffer, start, length, fileLength, control);
+                            if (next != start + length) throw new IOException("Mac 업로드 위치가 맞지 않습니다");
+                            offset = next;
+                            if (control != null) control.uploadProgress(item, offset, fileLength);
+                            break;
+                        } catch (IOException error) {
+                            if (retries >= MAX_RETRIES || !retryable(error)) throw error;
+                            waitForRetry(retries++, error, control);
+                            upload = retry(() -> beginUpload(validated, item, fileLength, sha256, control), control);
+                            complete = upload.optBoolean("complete");
+                            offset = upload.optLong("offset", -1);
+                            if (offset < 0 || offset > fileLength) {
+                                throw new IOException("Mac 업로드 위치가 올바르지 않습니다");
+                            }
+                            if (complete) break;
+                        }
+                    }
+                }
+                checkCancelled(control);
+                return retry(() -> finishUpload(validated, sha256, control), control);
+            }
+        }
+    }
+
+    static JSONObject syncAIRead(Pairing pairing, AIReadIntent intent, JSONObject uploaded,
+        ReceiveControl control) throws IOException {
+        HttpURLConnection connection = open(pairing, "/v1/phone-ai-read");
+        track(control, connection);
+        try {
+            JSONObject body = new JSONObject().put("id", intent.id).put("revision", intent.revision).put("allowed", intent.allowed);
+            if (intent.allowed) {
+                body.put("sourceID", uploaded.getString("id")).put("sha256", uploaded.getString("sha256"));
+            }
+            byte[] data = body.toString().getBytes(StandardCharsets.UTF_8);
+            connection.setRequestMethod("POST");
+            connection.setRequestProperty("Content-Type", "application/json");
+            connection.setDoOutput(true);
+            connection.setFixedLengthStreamingMode(data.length);
+            try (OutputStream output = connection.getOutputStream()) { output.write(data); }
+            requireSuccess(connection);
+            try (InputStream input = connection.getInputStream()) {
+                return new JSONObject(new String(readAll(input), StandardCharsets.UTF_8));
+            }
+        } catch (org.json.JSONException error) {
+            throw new IOException("Mac AI 읽기 응답을 확인할 수 없습니다", error);
+        } finally { connection.disconnect(); }
+    }
+
+    private static JSONObject beginUpload(Pairing pairing, StackItem item, long size, String sha256, ReceiveControl control) throws IOException {
+        HttpURLConnection connection = open(pairing, "/v1/uploads");
+        track(control, connection);
+        connection.setRequestMethod("POST");
+        connection.setDoOutput(true);
+        connection.setFixedLengthStreamingMode(0);
+        connection.setRequestProperty("X-Upload-ID", sha256);
+        connection.setRequestProperty("X-Item-Name", encodeHeader(item.name));
+        connection.setRequestProperty("X-Item-Mime", encodeHeader(item.mimeType));
+        connection.setRequestProperty("X-Item-Size", Long.toString(size));
+        connection.setRequestProperty("X-Item-SHA256", sha256);
+        try {
+            connection.getOutputStream().close();
+            requireSuccess(connection);
+            try (InputStream input = connection.getInputStream()) {
+                return new JSONObject(new String(readAll(input), StandardCharsets.UTF_8));
+            } catch (org.json.JSONException exception) {
+                throw new IOException("Mac 업로드 응답을 읽을 수 없습니다", exception);
+            }
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private static long sendUploadChunk(Pairing pairing, String sha256,
+        java.io.RandomAccessFile source, byte[] buffer, long offset, int length, long fileLength, ReceiveControl control) throws IOException {
+        HttpURLConnection connection = open(pairing, "/v1/uploads/" + sha256);
+        track(control, connection);
+        connection.setRequestMethod("PUT");
+        connection.setDoOutput(true);
+        connection.setFixedLengthStreamingMode(length);
+        connection.setRequestProperty("Content-Type", "application/octet-stream");
+        connection.setRequestProperty("Content-Range", "bytes " + offset + "-" + (offset + length - 1) + "/" + fileLength);
+        try {
+            try (OutputStream output = connection.getOutputStream()) {
+                source.seek(offset);
+                int remaining = length;
+                while (remaining > 0) {
+                    checkCancelled(control);
+                    int count = source.read(buffer, 0, Math.min(buffer.length, remaining));
+                    if (count < 0) throw new IOException("전송 중 원본 파일이 짧아졌습니다");
+                    output.write(buffer, 0, count);
+                    remaining -= count;
+                }
+            }
+            requireSuccess(connection);
+            try (InputStream input = connection.getInputStream()) {
+                return new JSONObject(new String(readAll(input), StandardCharsets.UTF_8)).optLong("offset", -1);
+            } catch (org.json.JSONException exception) {
+                throw new IOException("Mac 업로드 응답을 읽을 수 없습니다", exception);
+            }
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private static JSONObject finishUpload(Pairing pairing, String sha256, ReceiveControl control) throws IOException {
+        HttpURLConnection connection = open(pairing, "/v1/uploads/" + sha256 + "/finish");
+        track(control, connection);
+        connection.setRequestMethod("POST");
+        connection.setDoOutput(true);
+        connection.setFixedLengthStreamingMode(0);
+        try {
+            connection.getOutputStream().close();
+            requireSuccess(connection);
+            try (InputStream input = connection.getInputStream()) {
+                return new JSONObject(new String(readAll(input), StandardCharsets.UTF_8));
+            } catch (org.json.JSONException exception) {
+                throw new IOException("Mac 업로드 응답을 읽을 수 없습니다", exception);
+            }
+        } finally {
+            connection.disconnect();
+        }
     }
 
     interface ReceiveControl {
         boolean cancelled();
         void connection(HttpURLConnection connection);
         void progress(PendingItem item, long offset);
+        default void uploadProgress(StackItem item, long offset, long size) {}
     }
 
     static Pairing savedPairing(Context context) {
@@ -178,8 +270,19 @@ final class MacBridgeClient {
         }
     }
 
+    static void checkConnection(Context context, Pairing pairing) throws IOException {
+        HttpURLConnection connection = open(validate(context, pairing), "/v1/pending");
+        connection.setConnectTimeout(3000);
+        connection.setReadTimeout(3000);
+        try {
+            requireSuccess(connection);
+        } finally {
+            connection.disconnect();
+        }
+    }
+
     static List<PendingItem> pending(Context context, Pairing pairing) throws IOException {
-        return pending(context, pairing, null);
+        return retry(() -> pending(context, pairing, null), null);
     }
 
     private static List<PendingItem> pending(Context context, Pairing pairing, ReceiveControl control) throws IOException {
@@ -206,8 +309,8 @@ final class MacBridgeClient {
     }
 
     static synchronized int receive(Context context, Pairing pairing, List<String> selectedIDs, ReceiveControl control) throws IOException {
-        pairing = validate(context, pairing);
-        List<PendingItem> pending = pending(context, pairing, control);
+        Pairing validated = validate(context, pairing);
+        List<PendingItem> pending = retry(() -> pending(context, validated, control), control);
         Set<String> selected = selectedIDs == null ? null : new HashSet<>(selectedIDs);
         int received = 0;
         IOException failure = null;
@@ -217,36 +320,31 @@ final class MacBridgeClient {
             try {
                 if (control != null) control.progress(item, 0);
                 if (StackStore.hasFingerprint(context, item.sha256)) {
-                    acknowledge(pairing, item.id, control);
+                    retry(() -> { acknowledge(validated, item.id, control); return null; }, control);
                     continue;
                 }
                 File partial = StackStore.partialDownloadFile(context, item.id, item.size);
                 long offset = partial.length();
+                int retries = 0;
                 while (offset < item.size) {
                     checkCancelled(control);
                     if (control != null) control.progress(item, offset);
                     int length = (int) Math.min(CHUNK_SIZE, item.size - offset);
-                    HttpURLConnection content = open(pairing, "/v1/items/" + item.id + "/content");
-                    track(control, content);
-                    content.setRequestProperty("Range", "bytes=" + offset + "-" + (offset + length - 1));
                     try {
-                        if (content.getResponseCode() != HttpURLConnection.HTTP_PARTIAL
-                            || !("bytes " + offset + "-" + (offset + length - 1) + "/" + item.size).equals(content.getHeaderField("Content-Range"))) {
-                            throw new IOException("Mac 파일의 이어받기 응답이 올바르지 않습니다");
-                        }
-                        try (InputStream input = content.getInputStream()) {
-                            StackStore.appendDownloadedRange(new StackStore.DownloadChunk(partial, offset, length), input);
-                        }
+                        downloadRange(validated, item, partial, offset, length, control);
                         offset += length;
-                    } finally {
-                        content.disconnect();
+                        retries = 0;
+                    } catch (IOException error) {
+                        if (retries >= MAX_RETRIES || !retryable(error)) throw error;
+                        waitForRetry(retries++, error, control);
+                        offset = partial.length();
                     }
                 }
                 checkCancelled(control);
                 boolean added = StackStore.finishDownloadedFile(context, partial,
                     new StackStore.DownloadMetadata(item.mimeType, item.name, item.size, item.sha256));
                 if (added) StackBadge.update(context, StackStore.load(context).size());
-                acknowledge(pairing, item.id, control);
+                retry(() -> { acknowledge(validated, item.id, control); return null; }, control);
                 received++;
             } catch (IOException exception) {
                 checkCancelled(control);
@@ -255,6 +353,29 @@ final class MacBridgeClient {
         }
         if (failure != null) throw new IOException("수신 " + received + "개 · 일부 실패: " + failure.getMessage(), failure);
         return received;
+    }
+
+    private static void downloadRange(Pairing pairing, PendingItem item, File partial, long offset, int length,
+        ReceiveControl control) throws IOException {
+        HttpURLConnection content = open(pairing, "/v1/items/" + item.id + "/content");
+        track(control, content);
+        content.setRequestProperty("Range", "bytes=" + offset + "-" + (offset + length - 1));
+        try {
+            int status = content.getResponseCode();
+            if (status != HttpURLConnection.HTTP_PARTIAL) {
+                if (status < 200 || status >= 300) requireSuccess(content);
+                throw new IOException("Mac 파일의 이어받기 응답이 올바르지 않습니다");
+            }
+            if (!("bytes " + offset + "-" + (offset + length - 1) + "/" + item.size)
+                .equals(content.getHeaderField("Content-Range"))) {
+                throw new IOException("Mac 파일의 이어받기 응답이 올바르지 않습니다");
+            }
+            try (InputStream input = content.getInputStream()) {
+                StackStore.appendDownloadedRange(new StackStore.DownloadChunk(partial, offset, length), input);
+            }
+        } finally {
+            content.disconnect();
+        }
     }
 
     private static void acknowledge(Pairing pairing, String id, ReceiveControl control) throws IOException {
@@ -280,6 +401,69 @@ final class MacBridgeClient {
 
     private static void checkCancelled(ReceiveControl control) throws IOException {
         if (Thread.currentThread().isInterrupted() || (control != null && control.cancelled())) throw new IOException("수신이 중지됐습니다");
+    }
+
+    private interface IOOperation<T> { T run() throws IOException; }
+
+    private static <T> T retry(IOOperation<T> operation, ReceiveControl control) throws IOException {
+        for (int retries = 0; ; retries++) {
+            checkCancelled(control);
+            try {
+                return operation.run();
+            } catch (IOException error) {
+                if (retries >= MAX_RETRIES || !retryable(error)) throw error;
+                waitForRetry(retries, error, control);
+            }
+        }
+    }
+
+    private static boolean retryable(IOException error) {
+        if (error instanceof HttpFailure) {
+            int status = ((HttpFailure) error).status;
+            return status == 408 || status == 425 || status == 429 || status >= 500 && status <= 599;
+        }
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (cause instanceof SocketTimeoutException || cause instanceof SocketException
+                || cause instanceof ConnectException || cause instanceof NoRouteToHostException
+                || cause instanceof EOFException) return true;
+        }
+        return false;
+    }
+
+    private static void waitForRetry(int retryIndex, IOException error, ReceiveControl control) throws IOException {
+        long remaining = retryDelayMillis(retryIndex, error);
+        while (remaining > 0) {
+            checkCancelled(control);
+            long wait = Math.min(100, remaining);
+            long start = System.nanoTime();
+            try {
+                Thread.sleep(wait);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IOException("전송이 중지됐습니다", exception);
+            }
+            remaining -= Math.max(1, (System.nanoTime() - start) / 1_000_000);
+        }
+        checkCancelled(control);
+    }
+
+    private static long retryDelayMillis(int retryIndex, IOException error) {
+        if (error instanceof HttpFailure) {
+            String value = ((HttpFailure) error).retryAfter;
+            if (value != null) {
+                try {
+                    long seconds = Long.parseLong(value.trim());
+                    return seconds <= 0 ? 0 : seconds > Long.MAX_VALUE / 1000 ? Long.MAX_VALUE : seconds * 1000;
+                } catch (NumberFormatException ignored) {
+                    try {
+                        long delay = ZonedDateTime.parse(value, DateTimeFormatter.RFC_1123_DATE_TIME)
+                            .toInstant().toEpochMilli() - System.currentTimeMillis();
+                        return Math.max(0, delay);
+                    } catch (java.time.format.DateTimeParseException ignoredDate) { }
+                }
+            }
+        }
+        return 1000L << retryIndex;
     }
 
     private static HttpURLConnection open(Pairing pairing, String path) throws IOException {
@@ -344,6 +528,7 @@ final class MacBridgeClient {
     private static void requireSuccess(HttpURLConnection connection) throws IOException {
         int status = connection.getResponseCode();
         if (status >= 200 && status < 300) return;
+        String retryAfter = connection.getHeaderField("Retry-After");
         String message = "Mac 연결에 실패했습니다 (HTTP " + status + ")";
         try (InputStream input = connection.getErrorStream()) {
             if (input != null) {
@@ -352,7 +537,18 @@ final class MacBridgeClient {
                 message = error.optString("error", message);
             }
         } catch (Exception ignored) { }
-        throw new IOException(message);
+        throw new HttpFailure(status, retryAfter, message);
+    }
+
+    private static final class HttpFailure extends IOException {
+        final int status;
+        final String retryAfter;
+
+        HttpFailure(int status, String retryAfter, String message) {
+            super(message);
+            this.status = status;
+            this.retryAfter = retryAfter;
+        }
     }
 
     private static String encodeHeader(String value) {

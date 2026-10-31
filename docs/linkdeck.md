@@ -1,91 +1,99 @@
 # LinkDeck 앱 API 연결
 
-## 등록
+## 등록과 갱신
 
-1. `./script/build_and_run.sh`로 빌드합니다.
-2. LinkDeck 버튼에 작업 폴더 최상단의 `ShareStackMac.app`을 **앱 실행**으로 등록합니다.
+1. `./script/build_and_run.sh --build-only`로 작업 폴더 최상단의 `ShareStackMac.app`을 Release 빌드합니다. 이 모드는 실행 중인 앱을 종료하거나 새 GUI를 실행하지 않습니다. 빌드 후 실행까지 하려면 기존 `./script/build_and_run.sh`를 사용합니다.
+2. LinkDeck 버튼에 작업 폴더의 `ShareStackMac.app`을 **앱 실행**으로 등록합니다.
 3. 최초 앱 API 연결 승인을 완료합니다. **설정 → ChatGPT 연결 → 등록된 앱 API**에서 Share Stack을 확인합니다.
-4. ChatGPT 연결 중 추가했다면 도구 목록을 새로고침합니다.
+4. 앱 위치 또는 안내 JSON이 바뀌면 다시 승인하고, 연결 중 변경했다면 도구 목록을 새로고침합니다.
 
-앱 위치 또는 안내 JSON이 바뀌면 LinkDeck에서 다시 승인해야 합니다. 앱은 기존 TLS·짝 토큰을 앱 자체 Keychain에 보관합니다. LinkDeck의 OpenAI 키는 필요하지 않습니다. Keychain 접근이 차단되면 먼저 GUI 앱을 열어 접근을 허용한 뒤 다시 호출합니다.
+실제 배포 리소스는 `ShareStackMac.app/Contents/Resources/linkdeck.json`입니다. 원본은 `macos/ShareStackMac/Resources/linkdeck.json`이며 빌드가 번들에 복사합니다. 선언된 도구 이름은 실제 `--mcp`의 `tools/list` 전체 페이지와 정확히 일치해야 합니다. 불일치하면 LinkDeck이 앱 도구 공개를 차단합니다.
 
-Finder 공유 메뉴용 Share Extension은 앱과 확장에 App Group `group.com.pdg.sharestack` 권한이 필요합니다. 이 Mac에서는 해당 권한을 포함한 ad-hoc 서명과 `pluginkit` 등록으로 실제 Finder 수신을 확인했습니다. 다른 Mac 배포는 별도 서명·권한 검증이 필요합니다. `./script/build_and_run.sh`의 기본 빌드는 서명을 생략하며, 배포용 서명은 `SHARESTACK_CODE_SIGN_IDENTITY`와 `SHARESTACK_DEVELOPMENT_TEAM`을 설정합니다.
+LinkDeck은 같은 번들의 `Contents/MacOS/ShareStackMac`에 `--mcp`를 전달합니다. 셸이나 별도 인터프리터를 사용하지 않습니다. 앱의 인증서는 SHA-256 지문으로 확인하고 AI MCP 전용 토큰은 Keychain에서 읽습니다. 휴대전화 짝 토큰과 구분되며 LinkDeck의 OpenAI 키는 필요하지 않습니다. Keychain 접근이 차단되면 GUI 앱에서 접근을 허용한 뒤 다시 호출합니다.
 
-실제 배포 리소스는 `ShareStackMac.app/Contents/Resources/linkdeck.json`입니다. LinkDeck은 같은 번들의 `Contents/MacOS/ShareStackMac`에 `--mcp`를 전달합니다. 셸이나 별도 인터프리터를 사용하지 않습니다.
+## 접근 범위와 도구
 
-## 구조
+`LinkDeck → 앱 실행 파일 --mcp → 인증된 루프백 HTTPS → GUI의 실제 저장소`
 
-임시 보관 위치는 맥 앱의 **설정 → 임시 보관 폴더**에서 변경합니다. 선택한 위치의 전용 하위 폴더에 기존 대기 파일을 안전하게 옮기며, 보관함에서 취소한 파일은 그 위치에서도 삭제됩니다. 저장 수락 후의 저장 폴더는 별도 설정입니다. Finder 확장의 App Group 전달함은 기존 위치를 유지합니다.
+MCP 모드는 메뉴바 아이콘이나 두 번째 저장소를 만들지 않습니다. 실제 데이터 도구 호출 때 GUI가 없으면 해당 앱 번들을 실행하고 준비를 기다립니다. 도구 목록 조회와 인자 검증 오류는 GUI를 실행하지 않습니다. JSON-RPC 요청의 연결·응답 대기는 합계 8초로 제한합니다.
 
-`LinkDeck → 앱 실행 파일 --mcp → 인증된 루프백 HTTPS → GUI의 실제 저장소·작업 실행기`
-
-MCP 모드는 메뉴바 아이콘이나 두 번째 저장소를 만들지 않습니다. 조회 때 GUI가 없으면 현재 앱 번들을 실행하고 준비를 기다립니다. GUI의 기존 HTTPS API를 그대로 사용하며, 인증서 SHA-256을 확인하고 Keychain 토큰으로 인증합니다. 인증서 지문만 담긴 `gui-bridge.json`은 앱 데이터 폴더에 권한 0600으로 저장하며 비밀 토큰은 저장하지 않습니다.
-
-각 JSON-RPC 요청의 연결·응답 대기는 합계 8초로 제한합니다. GUI 준비가 늦거나 바쁘면 10초를 넘겨 기다리지 않고 MCP 도구 오류로 반환하므로 다시 조회할 수 있습니다. 오래 걸리는 파일 작업은 즉시 작업 ID를 반환합니다.
-
-## 도구
-
-LinkDeck에서 노출되는 이름에는 `linkdeck_app_share_stack__`이 붙습니다.
+LinkDeck에서 노출되는 이름에는 `linkdeck_app_share_stack__`이 붙습니다. 기존 파일용 7개 도구와 아래 폴더 작업공간용 7개 도구를 제공합니다.
 
 | 도구 | 입력 | 실제 동작 |
 |---|---|---|
-| `get_status` | 없음 | GUI 수신 설정, 연결 주소, 수신·송신 대기 개수 |
-| `list_inbox` | `limit`, `offset` 선택 | 임시 보관 파일 목록 |
-| `list_shared_files` | `limit`, `offset` 선택 | ShareStack에 받은 파일 목록. Finder 공유 확장 전송이 진행 중이면 `pendingImportCount`를 확인하고 다시 조회 |
-| `get_shared_file_info` | `id` | 파일 크기·MIME·SHA-256·상태 및 텍스트 읽기 가능 여부 |
-| `read_shared_file` | `id`, `offset`, `limit` 선택 | UTF-8 파일의 실제 내용 청크. 기본 4 KiB, 최대 32 KiB이며 다음 `nextOffset`으로 이어 읽기 |
-| `get_item` | `id` | 대기 중 항목의 상태·저장 오류 조회 |
-| `list_outbox` | `limit`, `offset` 선택 | 휴대전화 송신 대기열 |
-| `list_events` | `after`, `streamID` 함께 선택 | 앱의 파일 이벤트 |
-| `receive_files` | `ids` 배열 | 개별·선택 파일 수신 작업 시작 |
-| `receive_all` | 없음 | 실행 시점의 모든 보관함 파일 수신 시작 |
-| `cancel_inbox_files` | `ids` 배열 | 선택한 임시 파일과 항목 삭제 작업 |
-| `cancel_outbox_files` | `ids` 배열 | 아직 전송 대기 중인 앱 사본과 항목 삭제 작업. 원본 보존 |
-| `send_text` | `text` | 휴대전화로 보낼 텍스트 대기열 추가 작업 |
-| `send_files` | `paths` 배열 | 로컬 파일을 휴대전화 송신 대기열에 복사하는 작업 |
-| `add_inbox_files` | `paths` 배열 | 다른 앱의 로컬 파일을 실제 수신 흐름으로 추가. 수신 설정 적용 |
-| `receive_text_file` | `filename`, `content` | UTF-8 텍스트 내용을 파일로 복원해 기존 수신함 또는 자동 저장 폴더에 추가 |
-| `get_job` | `id` | 실행 중 또는 보관 중인 완료 작업의 상태·처리 개수·실패 항목 조회 |
-| `cancel_job` | `id` | 처리하지 않은 나머지 항목의 취소 요청 |
+| `list_shared_files` | `limit`, `offset` 선택 | 보관함에서 AI 읽기를 허용하고 준비가 완료된 파일 목록 |
+| `get_shared_file_info` | `id` | 체크된 파일의 MIME·크기·SHA-256·읽기 가능 여부 |
+| `read_shared_file` | `id`, `offset`, `limit` 선택 | 체크된 UTF-8 텍스트의 내용 청크 |
+| `receive_exchange_text_file` | `filename`, `content` | UTF-8 텍스트를 통합 보관함에 생성하고 메타데이터 반환. 휴대폰 전달 대기, AI 읽기는 기본 해제 |
+| `receive_text_file` | `filename`, `content` | 기존 수신 설정에 따라 일반 보관함 또는 자동 저장 폴더에 텍스트 파일을 추가하고 휴대폰 전달을 대기하는 작업 시작 |
+| `get_job` | `id` | AI MCP가 생성한 수신 작업의 상태·처리 개수·실패 조회 |
+| `cancel_job` | `id` | 해당 수신 작업의 남은 처리 취소 요청 |
 
-`limit`은 1–100(기본 50), `offset`은 0 이상입니다. 목록에 `nextOffset`이 있으면 다음 페이지로 조회합니다. 도구 정의 자체도 `tools/list`의 `nextCursor`로 7개씩 페이지 분할됩니다. 각 도구는 설명, 정확한 입력 스키마, 읽기·파괴·멱등·외부 접근 annotations를 반환합니다.
+GUI는 보관함 한 화면에서 수신 대기·저장 완료·기존 AI Exchange 파일을 보여줍니다. 각 항목의 **AI 읽기 허용** 체크가 완료된 파일만 MCP 목록·정보·본문 조회에 공개합니다. 새 파일과 기존 권한 필드가 없는 파일은 기본 해제입니다. `receive_exchange_text_file`로 AI가 만든 파일도 해제 상태이며, AI가 자신에게 읽기 권한을 부여하는 도구는 제공하지 않습니다. 기존 도구 이름·인자와 내부 저장 위치는 호환성을 위해 유지합니다.
 
-## 작업과 결과
+체크 시 0.7초 유예 후 파일 준비·SHA-256 검증을 수행합니다. 준비 중 재클릭은 취소하고, 취소된 작업의 늦은 완료는 공개 권한을 켜지 않습니다. 체크 해제는 즉시 이후 목록·정보·본문 접근을 차단합니다. 파일 준비는 백그라운드에서 최대 두 개씩 실행하며, 해제·취소는 긴 복사 작업 뒤에 대기하지 않습니다. 전체 읽기 중지는 GUI **설정 → AI 읽기 사용**에서 관리합니다.
 
-작업 시작 도구의 응답 `id`로 `get_job`을 호출합니다. `total`, `completed`는 처리 개수입니다. 완료 후 10분 동안 최대 20개의 작업 상태·처리 개수·실패 내용을 메모리에 보관합니다. 개수 제한을 넘으면 완료 시각이 오래된 작업부터 제거하며, 실행 중 작업은 이 제한에서 제외합니다. 만료된 작업은 not found를 반환합니다. 파일 결과나 저장 경로 목록은 보관하지 않습니다. `list_inbox`와 `list_outbox`로 현재 남아 있는 파일을 확인합니다.
+원본은 보존하고 AI용 사본은 디렉터리 0700·파일 0600 권한으로 관리합니다. 사본은 원본의 보관함 행에 연결되며 체크 해제로 삭제하지 않습니다. 다시 허용할 때 기존 사본을 검증해 재사용합니다. 변조·삭제·심볼릭 링크·권한 변경 시 읽기를 거부합니다. 임의 Mac 경로나 휴대전화 송신 대기열은 AI 읽기 대상이 아닙니다. `send_text`·`send_files` 및 수신함 일괄 처리 도구는 MCP에 공개하지 않습니다.
+
+목록의 `limit`은 1–100(기본 50), `offset`은 0 이상입니다. 응답에 `nextOffset`이 있으면 다음 페이지로 조회합니다. `read_shared_file`은 바이트 오프셋을 사용하고 UTF-8 문자를 나누지 않으며 기본 4 KiB, 최대 32 KiB를 반환합니다. 다음 `nextOffset`으로 이어 읽습니다. PDF·이미지와 잘못된 UTF-8은 텍스트 읽기 대상이 아닙니다.
+
+두 텍스트 생성 도구는 본문 최대 128 KiB를 받습니다. 경로나 다운로드 링크를 열지 않고 MCP 인자로 받은 내용을 기록하며 SHA-256을 검증합니다. 파일명은 임의 경로로 사용하지 않습니다. 일반 수신 파일 저장 시 이름이 겹치면 `(1)`, `(2)`를 붙이며 같은 내용은 기존 SHA-256 중복 제거 규칙을 따릅니다. AI용 사본은 별도 ID로 관리하되 통합 보관함에는 원본과 같은 행에 표시합니다.
+
+두 생성 경로의 파일은 기존 짝 연결의 휴대폰 수신 대기에 자동 등록됩니다. 휴대폰 앱이 꺼져 있으면 Mac 보관함에 보존하고, 앱을 다시 열 때 한 번 자동 수신합니다. **자동 수신**을 켜 두면 기존 15초 간격 확인도 유지합니다. 수신 확인이나 송신 취소는 Mac 원본을 삭제하지 않으며 수신 완료 여부는 Mac 재시작 후에도 유지됩니다. AI 읽기 체크와 휴대폰 전달은 별개이므로 휴대폰 수신만으로 AI 읽기를 허용하지 않습니다. 파일을 Mac에서 삭제하면 전달 대상에서도 제외합니다. 기존 보관함의 독립 AI 파일도 한 번 수신할 수 있지만, 휴대폰 원본에 연결한 AI용 사본은 순환 전송하지 않습니다.
+
+도구 정의는 `tools/list`에서 최대 7개씩 반환하며 필요한 경우 `nextCursor`로 이어 조회합니다. 각 도구는 입력 스키마와 읽기·파괴·멱등·외부 접근 annotations를 제공합니다. MCP stdout에는 JSON-RPC만 출력하고 로그는 stderr로 보냅니다. EOF로 MCP 프로세스를 종료해도 GUI는 유지됩니다.
+
+## 수신 작업
+
+`receive_text_file` 응답의 작업 `id`로 `get_job`을 호출합니다. `receive_exchange_text_file`은 파일 메타데이터를 직접 반환하므로 작업 조회가 필요하지 않습니다.
 
 - 진행 상태: `queued`, `running`, `cancelling`
 - 종료 상태: `succeeded`, `partial_failure`, `failed`, `cancelled`
 
-작업·결과는 디스크에 기록하지 않으며 앱을 재시작하면 작업 상태도 사라집니다. 완료 작업은 10분·최대 20개 한도 내에서만 유지합니다. 수신·송신이 완료된 파일 메타데이터는 대기 목록에서 제거합니다. 과거 작업 목록과 전송 기록 조회 도구는 제공하지 않습니다. 이전 버전의 jobs 파일은 읽지 않습니다.
+완료 작업은 메모리에 10분·최대 20개까지 보관하며 실행 중 작업은 이 제한에서 제외합니다. 작업 상태는 앱 재시작 후 사라집니다. 취소 전에 시작한 파일 이동·복사는 완료될 수 있고 완료한 저장은 되돌리지 않습니다.
 
-`list_shared_files`는 기존 수신함 항목을 ID로 제공합니다. 저장 수락 뒤에도 해당 ID와 메타데이터를 보존하므로 저장된 파일도 읽을 수 있습니다. 사용자가 임시 파일을 취소하면 항목과 파일이 함께 제거되어 읽을 수 없고, 저장 폴더에서 파일을 직접 삭제한 경우에는 `unavailable` 상태와 읽기 불가 정보가 반환됩니다. 다른 파일 시스템 경로를 읽는 도구는 없습니다.
-
-취소는 항목 사이에서 반영됩니다. 이미 진행 중인 파일 이동·복사는 완료될 수 있으며 완료된 저장이나 송신 대기열 추가는 되돌리지 않습니다. 대기열에 들어간 파일을 철회하려면 `cancel_outbox_files`를 사용합니다. 작업 성공은 휴대전화의 실제 수신 완료를 뜻하지 않습니다. 휴대전화가 **받기**를 실행한 뒤 해당 항목이 `list_outbox`에서 사라졌는지 확인합니다.
-
-파일은 절대 경로의 일반 파일만 허용하며 심볼릭 링크는 제외합니다. 한 작업은 파일 경로 16개 또는 항목 ID 100개까지 받습니다. 실제 파일 크기 제한은 기존과 같은 20 GiB입니다. 임의 저장 폴더 지정은 허용하지 않고 GUI 설정을 사용합니다. 임시 파일 삭제 도구는 사용자가 명시한 항목에만 호출합니다.
-
-`receive_text_file`은 로컬 경로나 ChatGPT 다운로드 링크를 열지 않고 MCP 인자로 받은 UTF-8 본문을 저장합니다. 본문은 최대 128 KiB이며, SHA-256을 계산한 뒤 디스크에 기록된 임시 파일의 해시와 비교합니다. 파일명은 경로로 사용하지 않고 수신 항목의 표시 이름으로만 전달하며, 저장 시 기존 파일명 충돌은 `(1)`, `(2)`를 붙여 보존합니다. 같은 내용의 중복 수신은 기존 SHA-256 중복 제거 규칙을 따릅니다. PDF·이미지 등 바이너리는 현재 이 도구에서 받지 않습니다.
-
-Finder 공유 확장은 최대 16개 파일(각 20 GiB까지)을 App Group의 임시 전달함으로 복사하고 SHA-256 manifest를 마지막에 기록합니다. 앱은 실행될 때 이 전달함을 기존 수신함으로 가져오며 원본 파일은 건드리지 않습니다. LinkDeck MCP의 파일 읽기는 SRT·Markdown·TXT·JSON 등 텍스트만 지원하고 파일 경로 대신 최대 32 KiB의 UTF-8 청크 내용을 반환합니다. 잘못된 UTF-8과 PDF·이미지 등의 텍스트 읽기는 오류입니다.
-
-## 내부 작업 API
-
-기존 [HTTP API](api.md)에 다음 GUI 작업 경로를 추가했습니다. 같은 TLS·Bearer 인증이 필요하며 **루프백 연결에서만** 사용할 수 있습니다. LinkDeck과 직접 통신하는 전송 방식은 여전히 MCP stdio입니다.
-
-- `POST /v1/jobs`: JSON `operation`과 `itemIDs`·`filePaths`·`text`·`filename`·`content`로 작업 생성
-- `GET /v1/jobs/{id}`: 실행 중 작업의 진행 상태
-- `POST /v1/jobs/{id}/cancel`: 나머지 항목 취소 요청
-- `GET /v1/items/{id}`: 기존 항목의 메타데이터 조회
-
-작업 `operation`은 `receive`, `receiveAll`, `cancelInbox`, `cancelOutbox`, `sendText`, `sendFiles`, `importFiles`, `receiveTextFile`입니다. 이벤트에는 `outbox.cancelled`도 포함됩니다.
+내부 HTTP API는 기존 TLS 인증과 호출자별 권한 검사를 유지합니다. AI MCP 토큰은 루프백에서만 허용하며 준비 확인용 `/v1/health`, `/v1/shared-files`, `/v1/ai-exchange/text`, 허용된 텍스트 수신 작업의 `/v1/jobs` 경로만 접근합니다. 휴대전화 토큰은 AI용 목록·정보·본문 API와 AI Exchange 생성 API에 접근할 수 없습니다. 휴대폰에 전달할 AI 생성 파일은 기존 휴대폰 전송 API로만 받습니다. 일반 파일 전송의 최대 20 GiB·8 MiB 청크 규격은 그대로 유지합니다.
 
 ## 검증
 
 ```sh
-python3 -u script/verify_mcp.py --bundle ShareStackMac.app
+./script/build_and_run.sh --build-only
+python3 -B -u script/verify_mcp.py --bundle ShareStackMac.app
 ```
 
-실제 번들 실행 파일을 자식 프로세스로 띄워 JSON-RPC 초기화, 도구 목록, GUI 자동 실행, 기존 파일 전송 및 `receive_text_file`, shared-file MCP 목록·정보·UTF-8 청크 읽기를 확인합니다. Finder 메뉴 노출은 macOS LaunchServices 등록 및 Finder UI 확인이 별도로 필요하며 자동 MCP 검증만으로 확인되지 않습니다. 검증은 고유한 이름의 합성 파일만 만들고 원본 파일을 보존합니다.
+검증 스크립트는 실제 번들 실행 파일의 초기화·도구 목록·정확한 14개 접근 범위·번들 JSON 일치·입력 오류·제거된 도구 거부를 확인합니다. GUI를 실행하거나 종료하지 않고 사용자 파일·대기열·설정을 변경하지 않습니다. 앱 리소스 변경 후 배포 전에 실행합니다.
 
-MCP stdout에는 JSON-RPC만 출력하고 로그는 stderr로 보냅니다. EOF로 MCP 프로세스를 종료해도 GUI는 유지됩니다. JSON 안내 파일에는 경로, 토큰, 키 또는 인증 정보가 들어가지 않습니다.
+저장·해시·항목별 기본 해제·유예·취소·권한 해제와 기존 저장 형식 호환성는 `macos/ShareStackMac/Tests/AIExchangeRegression.swift`에서 전용 임시 저장소로 검증합니다. 실제 LinkDeck 승인을 거친 도구 공개, GUI 연결과 Keychain 접근은 별도 통합 확인이 필요합니다. Finder 확장 등록·서명은 기존 빌드·배포 절차를 따릅니다.
+
+## 폴더 작업공간 (M1–M3)
+
+기존 파일 도구에 작업공간 도구 7개가 추가되어 전체 도구는 14개입니다.
+
+| 도구 | 필수 인자 | 동작 |
+|---|---|---|
+| `list_workspaces` | 없음 | 현재 연결에 GUI에서 승인한 작업공간과 자신의 `sessionId` |
+| `list_workspace_entries` | `workspaceId` | 상대 디렉터리 탐색. `relativePath`, `cursor`, `limit` 선택 |
+| `get_workspace_file_info` | `workspaceId`, `fileId` | 크기, SHA-256, baseline 해시, 내용 버전 |
+| `read_workspace_file` | `workspaceId`, `fileId` | UTF-8 구간 읽기. `offset`, `limit` 선택, 최대 32 KiB |
+| `list_workspace_changes` | `workspaceId` | 원본과 독립된 baseline 대비 unified diff |
+| `apply_workspace_patch` | `workspaceId`, `fileId`, `expectedHash`, `patch`, `requestKey` | 편집 모드에서 단일 파일 unified diff 적용 |
+| `create_workspace_text_file` | `workspaceId`, `relativePath`, `content`, `requestKey` | 편집 모드에서 최대 128 KiB 텍스트 생성 |
+
+1. 앱 **설정 → 폴더 작업공간 → 폴더 추가…**에서 원본을 선택하고 포함·제외 건수를 검토합니다. 복사본은 비공개로 저장됩니다.
+2. AI에서 `list_workspaces`를 호출합니다. 처음에는 빈 목록과 연결 ID가 반환됩니다.
+3. 설정에서 같은 ID의 **승인할 AI 연결**을 선택하고 작업공간을 **읽기 전용 / 분석** 또는 **격리 복사본 편집**으로 바꿉니다. 클라이언트 이름은 클라이언트가 제공하므로 요청 직후 나타난 ID를 확인합니다.
+4. 다른 연결은 같은 AI bearer 토큰을 사용해도 해당 작업공간을 읽지 못합니다. 연결 자격증명은 서버가 생성하고 GUI만 권한을 부여합니다. AI가 모드를 바꾸는 도구나 HTTP 경로는 없습니다.
+5. 비공개 전환, 연결 승인 취소, 작업공간 삭제는 이후 요청을 차단합니다. 처리 중 편집은 마지막 원자적 확정 전에 권한 세대를 다시 검사합니다. 이미 확정된 변경은 남고 아직 확정되지 않은 변경은 거부됩니다.
+6. **변경 내용 확인**에서 diff를 봅니다. 삭제는 관리 복사본만 지웁니다. 원본 반영(M4)은 비활성화되어 있습니다.
+
+모드는 재시작 후 유지하지만 연결 승인은 메모리에만 있으며 새 프로세스/앱 재시작 시 다시 승인해야 합니다. 연결은 24시간 뒤 만료됩니다. 전체 **AI 읽기 사용**을 끄면 작업공간 탐색·읽기·편집도 거부됩니다. 이미 모델에 전달한 내용은 회수할 수 없습니다.
+
+작업공간당 파일 10,000개, 탐색 항목 20,000개, 깊이 32, 원본 복사 합계 1 GiB, 파일당 100 MiB, 작업공간 32개가 초기 상한입니다. 숨김 파일, `.git`, `.env`, node_modules, 빌드·캐시, 인증서·개인키·토큰 등 알려진 비밀 파일명, 링크·별칭·특수 파일·앱 번들을 제외합니다. 하드링크는 독립 바이트로 복사합니다. 파일 이름에 비밀임을 나타내는 표식이 없는 일반 텍스트까지 자동 검출하지는 않으므로 포함 요약과 원본 선택을 검토해야 합니다.
+
+편집은 불변 payload와 원자적 manifest 교체로 확정합니다. `expectedHash`가 현재 해시와 다르면 `CONFLICT`입니다. 같은 `requestKey`와 같은 요청은 같은 결과를 반환하며, 같은 키의 다른 요청은 충돌입니다. 작업공간당 1,000개 키를 보관하며 가득 차면 추가 편집을 거부합니다. 파일 삭제·이름 변경·명령 실행·원본 반영은 도구에 포함하지 않습니다.
+
+patch는 파일 하나의 표준 unified diff이며 헤더가 정확히 `--- a/<상대경로>`, `+++ b/<상대경로>`여야 합니다. fuzz, 외부 명령 실행, 다른 파일 대상 지정은 지원하지 않습니다. PDF·이미지·바이너리는 목록/메타데이터만 조회합니다. 분석 보고서를 저장할 때는 작업공간 밖의 기존 `receive_exchange_text_file`을 사용합니다.
+
+변경사항 조회는 `cursor`(기본 `0:0`)와 `limit`(기본20, 최대100)으로 페이지를 이어갑니다. `diffOffset` 순서로 같은 파일의 `diff`를 합치고 `nextCursor`가 없어질 때까지 조회합니다. diff 청크는 256 KiB, 페이지 전체 diff는 1 MiB로 제한하며 UTF-8 문자를 나누지 않습니다. GUI는 첫 페이지를 미리보기하고 추가 페이지 존재를 표시합니다. 격리 편집의 입력과 결과 파일은 각각 128 KiB/1 MiB 상한이며, 더 큰 파일(최대100 MiB)은 읽기 전용 분석만 지원합니다.
+
+여러 diff 페이지를 읽는 동안 같은 파일의 `version`이 바뀌면 조합을 중단하고 첫 페이지부터 다시 조회하세요. 본문을 여러 청크로 읽을 때도 파일 정보를 전후 비교해 같은 SHA-256/버전인지 확인할 수 있습니다. 만료되거나 승인 취소한 MCP 연결은 다시 연결한 후 새 sessionId를 GUI에서 승인합니다.

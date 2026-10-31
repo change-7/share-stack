@@ -13,6 +13,7 @@ final class TransferHTTPServer {
     private static let idleTimeout: TimeInterval = 120
     private static let idleSweepInterval: TimeInterval = 15
 
+    private let listeningPort: UInt16
     private let store: TransferStore
     private let token: String
     private let aiToken: String
@@ -24,6 +25,7 @@ final class TransferHTTPServer {
     private let uploadQueue = DispatchQueue(label: "com.pdg.sharestack.mac.transfer-upload", qos: .userInitiated,
                                              autoreleaseFrequency: .workItem)
     private var listener: NWListener?
+    private var portRetryDelay: TimeInterval = 0.25
     private var connections: [ObjectIdentifier: ConnectionEntry] = [:]
     private var idleTimer: DispatchSourceTimer?
     private let aiJobLock = NSLock()
@@ -39,7 +41,8 @@ final class TransferHTTPServer {
         var isProcessing = false
     }
 
-    init(store: TransferStore, token: String, aiToken: String, tlsIdentity: TLSIdentity) throws {
+    init(store: TransferStore, token: String, aiToken: String, tlsIdentity: TLSIdentity, listeningPort: UInt16 = TransferHTTPServer.port) throws {
+        self.listeningPort = listeningPort
         self.store = store
         self.token = token
         self.aiToken = aiToken
@@ -48,20 +51,34 @@ final class TransferHTTPServer {
     }
 
     func start() throws {
-        guard let port = NWEndpoint.Port(rawValue: Self.port) else { throw ServerError.invalidPort }
+        guard let port = NWEndpoint.Port(rawValue: listeningPort) else { throw ServerError.invalidPort }
         let tls = NWProtocolTLS.Options()
         sec_protocol_options_set_local_identity(tls.securityProtocolOptions, tlsIdentity.identity)
         let parameters = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
         let listener = try NWListener(using: parameters, on: port)
-        listener.service = NWListener.Service(name: "Share Stack", type: NetworkIdentity.bonjourType, domain: nil, txtRecord: nil)
-        listener.stateUpdateHandler = { [weak self] state in
+        if listeningPort == Self.port { listener.service = NWListener.Service(name: "Share Stack", type: NetworkIdentity.bonjourType, domain: nil, txtRecord: nil) }
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
+            guard let self, let listener, self.listener === listener else { return }
             switch state {
             case .ready:
-                self?.statusHandler?("갤럭시 연결 준비됨")
+                self.portRetryDelay = 0.25
+                self.statusHandler?("갤럭시 연결 준비됨")
             case .failed(let error):
-                self?.statusHandler?("수신 서버 오류 · \(error.localizedDescription)")
+                self.statusHandler?("수신 서버 오류 · \(error.localizedDescription)")
+                if case .posix(.EADDRINUSE) = error {
+                    // A duplicate/relaunch can briefly own the port; a failed NWListener never retries itself.
+                    listener.stateUpdateHandler = nil
+                    listener.cancel()
+                    let delay = self.portRetryDelay
+                    self.portRetryDelay = min(delay * 2, 4)
+                    self.queue.asyncAfter(deadline: .now() + delay) { [weak self, weak listener] in
+                        guard let self, let listener, self.listener === listener else { return }
+                        do { try self.start() }
+                        catch { self.statusHandler?("수신 서버 오류 · \(error.localizedDescription)") }
+                    }
+                }
             case .cancelled:
-                self?.statusHandler?("수신 서버 중지됨")
+                self.statusHandler?("수신 서버 중지됨")
             default:
                 break
             }
@@ -177,14 +194,16 @@ final class TransferHTTPServer {
             return
         }
         if caller == .aiMCP && !Self.isLoopback(connection.currentPath?.remoteEndpoint) {
-            sendError(connection, status: 403, message: "Operation is not available to this caller")
+            sendError(connection, status: 403, message: "PERMISSION_DENIED")
             return
         }
         let path = request.target.split(separator: "?", maxSplits: 1).first.map(String.init) ?? request.target
         guard Self.mayAccess(path, caller: caller) else {
-            sendError(connection, status: 403, message: "Operation is not available to this caller")
+            sendError(connection, status: 403, message: "PERMISSION_DENIED")
             return
         }
+        if routeWorkspaces(connection, request: request, path: path, initialBody: initialBody, caller: caller) { return }
+        if routePhoneAIRead(connection, request: request, path: path, initialBody: initialBody, caller: caller) { return }
         if routeExchangeText(connection, request: request, path: path, initialBody: initialBody, caller: caller) { return }
         if routeSharedFiles(connection, request: request, path: path, caller: caller) { return }
         if routeJobs(connection, request: request, path: path, initialBody: initialBody, caller: caller) { return }
@@ -277,19 +296,12 @@ final class TransferHTTPServer {
                 sendError(connection, status: 400, message: "Invalid upload chunk")
                 return
             }
-            receiveBodyData(connection, expectedLength: request.contentLength, accumulated: initialBody) { [weak self] data in
-                guard let self, let data else {
-                    self?.sendError(connection, status: 400, message: "Incomplete upload chunk")
-                    return
-                }
-                self.uploadQueue.async {
-                    do {
-                        let status = try self.store.appendUploadChunk(id, range: range, data: data)
-                        self.sendJSON(connection, status: 200, value: status)
-                    } catch {
-                        self.sendError(connection, status: 409, message: error.localizedDescription)
-                    }
-                }
+            do {
+                let writer = try store.beginUploadChunk(id, range: range)
+                receiveUploadChunk(connection, writer: writer, expectedLength: request.contentLength,
+                                   initialBody: initialBody, received: 0)
+            } catch {
+                sendError(connection, status: 409, message: error.localizedDescription)
             }
             return
         }
@@ -351,10 +363,95 @@ final class TransferHTTPServer {
         sendError(connection, status: 404, message: "Not found")
     }
 
+    private func routeWorkspaces(_ connection: NWConnection, request: HTTPRequest, path: String,
+                                 initialBody: Data, caller: Caller) -> Bool {
+        guard path == "/v1/workspace-session" || path == "/v1/workspaces" || path.hasPrefix("/v1/workspaces/") else { return false }
+        guard caller == .aiMCP else { sendError(connection, status: 403, message: "PERMISSION_DENIED"); return true }
+        func respond(_ body: [String: Any]) {
+            workQueue.async {
+                do {
+                    let workspace = try self.store.workspaceStore()
+                    if path == "/v1/workspace-session" {
+                        guard request.method == "POST", Set(body.keys) == ["label"], let label = body["label"] as? String, label.utf8.count <= 256 else { throw WorkspaceStore.Failure.invalid }
+                        self.sendJSON(connection, status: 200, value: try workspace.registerSession(label: label))
+                        return
+                    }
+                    guard let credential = request.headers["x-workspace-session"], credential.count <= 128 else { throw WorkspaceStore.Failure.denied }
+                    let parts = path.split(separator: "/").map(String.init)
+                    let query = URLComponents(string: request.target)?.queryItems ?? []
+                    guard Set(query.map(\.name)).count == query.count else { throw WorkspaceStore.Failure.invalid }
+                    func number(_ key: String, _ fallback: Int) throws -> Int { guard let item = query.first(where: { $0.name == key }) else { return fallback }; guard let value = item.value, let n = Int(value), n >= 0 else { throw WorkspaceStore.Failure.invalid }; return n }
+                    if request.method == "GET" {
+                        guard request.contentLength == 0 else { throw WorkspaceStore.Failure.invalid }
+                        if parts.count == 2 {
+                            guard query.isEmpty else { throw WorkspaceStore.Failure.invalid }
+                            let records = try workspace.visibleWorkspaces(credential: credential)
+                            self.sendJSON(connection, status: 200, value: ["items": records.map { ["id": $0.id, "name": $0.name, "mode": $0.mode.rawValue] }]); return
+                        }
+                        guard parts.count >= 4, UUID(uuidString: parts[2]) != nil else { throw WorkspaceStore.Failure.denied }
+                        let id = parts[2].lowercased()
+                        if parts.count == 4 && parts[3] == "entries" {
+                            guard Set(query.map(\.name)).isSubset(of: ["relativePath", "cursor", "limit"]) else { throw WorkspaceStore.Failure.invalid }
+                            let value = try workspace.entries(id, path: query.first(where: { $0.name == "relativePath" })?.value ?? "", cursor: number("cursor", 0), limit: number("limit", 50), credential: credential)
+                            self.sendJSON(connection, status: 200, value: value); return
+                        }
+                        if parts.count == 4 && parts[3] == "changes" {
+                            guard Set(query.map(\.name)).isSubset(of: ["cursor", "limit"]) else { throw WorkspaceStore.Failure.invalid }
+                            self.sendJSON(connection, status: 200, value: try workspace.changes(id, cursor: query.first(where: { $0.name == "cursor" })?.value ?? "0:0", limit: number("limit", 20), credential: credential)); return
+                        }
+                        if parts.count >= 5 && parts[3] == "files", UUID(uuidString: parts[4]) != nil {
+                            if parts.count == 5 {
+                                guard query.isEmpty else { throw WorkspaceStore.Failure.invalid }
+                                self.sendJSON(connection, status: 200, value: try workspace.info(id, fileID: parts[4].lowercased(), credential: credential)); return
+                            }
+                            if parts.count == 6 && parts[5] == "content" {
+                                guard Set(query.map(\.name)).isSubset(of: ["offset", "limit"]) else { throw WorkspaceStore.Failure.invalid }
+                                self.sendJSON(connection, status: 200, value: try workspace.read(id, fileID: parts[4].lowercased(), offset: number("offset", 0), limit: number("limit", 4096), credential: credential)); return
+                            }
+                        }
+                        throw WorkspaceStore.Failure.denied
+                    }
+                    guard request.method == "POST", query.isEmpty, parts.count == 4, UUID(uuidString: parts[2]) != nil else { throw WorkspaceStore.Failure.denied }
+                    let id = parts[2].lowercased()
+                    func string(_ key: String) throws -> String { guard let value = body[key] as? String else { throw WorkspaceStore.Failure.invalid }; return value }
+                    if parts[3] == "create" {
+                        guard Set(body.keys) == ["relativePath", "content", "requestKey"] else { throw WorkspaceStore.Failure.invalid }
+                        self.sendJSON(connection, status: 200, value: try workspace.create(id, path: string("relativePath"), content: string("content"), requestKey: string("requestKey"), credential: credential)); return
+                    }
+                    if parts[3] == "patch" {
+                        guard Set(body.keys) == ["fileId", "expectedHash", "patch", "requestKey"] else { throw WorkspaceStore.Failure.invalid }
+                        self.sendJSON(connection, status: 200, value: try workspace.patch(id, fileID: string("fileId"), expectedHash: string("expectedHash"), patch: string("patch"), requestKey: string("requestKey"), credential: credential)); return
+                    }
+                    throw WorkspaceStore.Failure.denied
+                } catch let error as WorkspaceStore.Failure {
+                    let message: String, status: Int
+                    switch error {
+                    case .denied: message = "PERMISSION_DENIED"; status = 403
+                    case .conflict: message = "CONFLICT"; status = 409
+                    case .limit: message = "LIMIT_EXCEEDED"; status = 413
+                    case .invalid: message = "INVALID_REQUEST"; status = 400
+                    case .io: message = "WORKSPACE_UNAVAILABLE"; status = 409
+                    }
+                    self.sendError(connection, status: status, message: message)
+                } catch { self.sendError(connection, status: 409, message: "WORKSPACE_UNAVAILABLE") }
+            }
+        }
+        if request.method == "GET" { respond([:]); return true }
+        guard request.method == "POST", request.contentLength > 0, request.contentLength <= 1024 * 1024,
+              request.headers["content-type"]?.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased() == "application/json" else {
+            sendError(connection, status: 403, message: "PERMISSION_DENIED"); return true
+        }
+        receiveBodyData(connection, expectedLength: request.contentLength, accumulated: initialBody) { data in
+            guard let data, let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { self.sendError(connection, status: 400, message: "INVALID_REQUEST"); return }
+            respond(body)
+        }
+        return true
+    }
+
     private func routeSharedFiles(_ connection: NWConnection, request: HTTPRequest, path: String, caller: Caller) -> Bool {
         guard path == "/v1/shared-files" || path.hasPrefix("/v1/shared-files/") else { return false }
         guard caller == .aiMCP else {
-            sendError(connection, status: 403, message: "Operation is not available to this caller")
+            sendError(connection, status: 403, message: "PERMISSION_DENIED")
             return true
         }
         guard request.method == "GET", request.contentLength == 0 else {
@@ -432,8 +529,8 @@ final class TransferHTTPServer {
                 do {
                     guard let data else { throw JobError.invalidInput }
                     let request = try JSONDecoder().decode(TransferJobRequest.self, from: data)
-                    if caller == .aiMCP && !Self.maySubmitAIJob(request.operation) {
-                        self.sendError(connection, status: 403, message: "Operation is not available to this caller")
+                    if !Self.maySubmitHTTPJob(request.operation, caller: caller) {
+                        self.sendError(connection, status: 403, message: "PERMISSION_DENIED")
                         return
                     }
                     let job = try self.jobs.submit(request)
@@ -496,12 +593,18 @@ final class TransferHTTPServer {
 
     static func mayAccess(_ path: String, caller: Caller) -> Bool {
         let sharedFiles = path == "/v1/shared-files" || path.hasPrefix("/v1/shared-files/")
+        let workspaces = path == "/v1/workspace-session" || path == "/v1/workspaces" || path.hasPrefix("/v1/workspaces/")
         let jobs = path == "/v1/jobs" || path.hasPrefix("/v1/jobs/")
         let exchangeText = path == "/v1/ai-exchange/text"
         switch caller {
-        case .phone: return !sharedFiles && !exchangeText
-        case .aiMCP: return sharedFiles || jobs || exchangeText
+        case .phone: return !sharedFiles && !exchangeText && !workspaces
+        case .aiMCP: return path == "/v1/health" || sharedFiles || jobs || exchangeText || workspaces
         }
+    }
+
+    static func maySubmitHTTPJob(_ operation: TransferJobRequest.Operation, caller: Caller) -> Bool {
+        guard operation != .sendFiles && operation != .importFiles else { return false }
+        return caller != .aiMCP || maySubmitAIJob(operation)
     }
 
     static func maySubmitAIJob(_ operation: TransferJobRequest.Operation) -> Bool {
@@ -522,7 +625,7 @@ final class TransferHTTPServer {
                                    initialBody: Data, caller: Caller) -> Bool {
         guard path == "/v1/ai-exchange/text" else { return false }
         guard caller == .aiMCP else {
-            sendError(connection, status: 403, message: "Operation is not available to this caller")
+            sendError(connection, status: 403, message: "PERMISSION_DENIED")
             return true
         }
         guard request.method == "POST", request.contentLength > 0, request.contentLength <= 1024 * 1024,
@@ -546,6 +649,34 @@ final class TransferHTTPServer {
                 self.sendJSON(connection, status: 201, value: file)
             } catch {
                 self.sendError(connection, status: 400, message: "AI Exchange text registration failed")
+            }
+        }
+        return true
+    }
+
+    private func routePhoneAIRead(_ connection: NWConnection, request: HTTPRequest, path: String,
+                                  initialBody: Data, caller: Caller) -> Bool {
+        guard path == "/v1/phone-ai-read" else { return false }
+        guard caller == .phone else {
+            sendError(connection, status: 403, message: "PERMISSION_DENIED")
+            return true
+        }
+        guard request.method == "POST", request.contentLength > 0, request.contentLength <= 4096,
+              request.headers["content-type"]?.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased() == "application/json" else {
+            sendError(connection, status: 400, message: "Invalid phone consent request")
+            return true
+        }
+        receiveBodyData(connection, expectedLength: request.contentLength, accumulated: initialBody) { [weak self] data in
+            guard let self else { return }
+            guard let data, let intent = try? JSONDecoder().decode(PhoneAIReadRequest.self, from: data) else {
+                self.sendError(connection, status: 400, message: "Invalid phone consent request")
+                return
+            }
+            self.beginProcessing(connection)
+            self.workQueue.async {
+                defer { self.endProcessing(connection); self.itemsChangedHandler?() }
+                do { self.sendJSON(connection, status: 200, value: try self.store.applyPhoneAIRead(intent)) }
+                catch { self.sendError(connection, status: 409, message: error.localizedDescription) }
             }
         }
         return true
@@ -680,6 +811,82 @@ final class TransferHTTPServer {
         }
         let buffer = BodyBuffer(accumulated, capacity: Int(expectedLength))
         collectBodyData(connection, expectedLength: expectedLength, buffer: buffer, completion: completion)
+    }
+
+    private func receiveUploadChunk(
+        _ connection: NWConnection,
+        writer: UploadChunkWriter,
+        expectedLength: Int64,
+        initialBody: Data,
+        received: Int64
+    ) {
+        guard Int64(initialBody.count) <= expectedLength - received else {
+            writer.cancel()
+            sendError(connection, status: 400, message: "Request body exceeds Content-Length")
+            return
+        }
+        if received + Int64(initialBody.count) == expectedLength {
+            uploadQueue.async { [weak self] in
+                guard let self else { writer.cancel(); return }
+                do {
+                    if !initialBody.isEmpty { try writer.append(initialBody) }
+                    self.sendJSON(connection, status: 200, value: try writer.finish())
+                } catch {
+                    writer.cancel()
+                    self.sendError(connection, status: 500, message: "Cannot write upload")
+                }
+            }
+            return
+        }
+        if !initialBody.isEmpty {
+            let next = received + Int64(initialBody.count)
+            uploadQueue.async { [weak self] in
+                guard let self else { writer.cancel(); return }
+                do {
+                    try writer.append(initialBody)
+                    self.queue.async { [weak self] in
+                        guard let self else { writer.cancel(); return }
+                        self.receiveUploadChunk(connection, writer: writer, expectedLength: expectedLength,
+                                                initialBody: Data(), received: next)
+                    }
+                } catch {
+                    writer.cancel()
+                    self.sendError(connection, status: 500, message: "Cannot write upload")
+                }
+            }
+            return
+        }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.transferBufferSize) { [weak self] data, _, isComplete, error in
+            guard let self, error == nil, let data, !data.isEmpty else {
+                writer.cancel()
+                connection.cancel()
+                return
+            }
+            self.touch(connection)
+            let next = received + Int64(data.count)
+            guard next <= expectedLength else {
+                writer.cancel()
+                self.sendError(connection, status: 400, message: "Request body exceeds Content-Length")
+                return
+            }
+            self.uploadQueue.async {
+                do {
+                    try writer.append(data)
+                    if isComplete && next < expectedLength {
+                        writer.cancel()
+                        connection.cancel()
+                    } else {
+                        self.queue.async { [self] in
+                            self.receiveUploadChunk(connection, writer: writer, expectedLength: expectedLength,
+                                                    initialBody: Data(), received: next)
+                        }
+                    }
+                } catch {
+                    writer.cancel()
+                    self.sendError(connection, status: 500, message: "Cannot write upload")
+                }
+            }
+        }
     }
 
     private final class BodyBuffer {

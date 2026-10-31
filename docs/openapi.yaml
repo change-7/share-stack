@@ -1,13 +1,133 @@
 openapi: 3.0.3
 info:
   title: Share Stack Control API
-  version: 1.0.0
+  version: 1.1.0
   description: HTTPS with certificate SHA-256 pinning and the paired device bearer token.
 servers:
   - url: https://127.0.0.1:8765
 security:
   - bearerAuth: []
 paths:
+  /v1/workspace-session:
+    post:
+      operationId: registerWorkspaceSession
+      description: Loopback AI token only. Issues a pending session credential; GUI approval is required before any workspace access. Does not grant permissions.
+      security: [{aiBearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [label]
+              properties:
+                label: {type: string, maxLength: 256}
+      responses:
+        '200': {description: Pending session id and secret credential. Never log the credential.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/workspaces:
+    get:
+      operationId: listWorkspaces
+      description: Only GUI-approved workspaces for this connection. Private and other-session workspaces are invisible.
+      security: [{aiBearerAuth: [], workspaceSession: []}]
+      responses:
+        '200': {description: Workspace id/name/mode summaries in items.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/workspaces/{workspaceId}/entries:
+    get:
+      operationId: listWorkspaceEntries
+      description: Page directory entries by safe relative path.
+      security: [{aiBearerAuth: [], workspaceSession: []}]
+      parameters:
+        - {in: path, name: workspaceId, required: true, schema: {type: string, format: uuid}}
+        - {in: query, name: relativePath, schema: {type: string, default: ""}}
+        - {in: query, name: cursor, schema: {type: string, default: "0"}}
+        - {in: query, name: limit, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+      responses:
+        '200': {description: Approved managed-copy data.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/workspaces/{workspaceId}/files/{fileId}:
+    get:
+      operationId: getWorkspaceFileInfo
+      description: File size, SHA-256, baseline hash and content version. Binary metadata only.
+      security: [{aiBearerAuth: [], workspaceSession: []}]
+      parameters:
+        - {in: path, name: workspaceId, required: true, schema: {type: string, format: uuid}}
+        - {in: path, name: fileId, required: true, schema: {type: string, format: uuid}}
+      responses:
+        '200': {description: Approved managed-copy data.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/workspaces/{workspaceId}/files/{fileId}/content:
+    get:
+      operationId: readWorkspaceFile
+      description: UTF-8 text only, preserving codepoint boundaries; nextOffset/hasMore.
+      security: [{aiBearerAuth: [], workspaceSession: []}]
+      parameters:
+        - {in: path, name: workspaceId, required: true, schema: {type: string, format: uuid}}
+        - {in: path, name: fileId, required: true, schema: {type: string, format: uuid}}
+        - {in: query, name: offset, schema: {type: integer, minimum: 0, default: 0}}
+        - {in: query, name: limit, schema: {type: integer, minimum: 4, maximum: 32768, default: 4096}}
+      responses:
+        '200': {description: Approved managed-copy data.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/workspaces/{workspaceId}/changes:
+    get:
+      operationId: listWorkspaceChanges
+      description: Bounded unified diff chunks. Concatenate same-file chunks by diffOffset and follow nextCursor. 256 KiB per chunk, 1 MiB diff bytes per response.
+      security: [{aiBearerAuth: [], workspaceSession: []}]
+      parameters:
+        - {in: path, name: workspaceId, required: true, schema: {type: string, format: uuid}}
+        - {in: query, name: cursor, schema: {type: string, default: "0:0"}}
+        - {in: query, name: limit, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+      responses:
+        '200': {description: Approved managed-copy data.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/workspaces/{workspaceId}/create:
+    post:
+      operationId: createWorkspaceTextFile
+      description: GUI-approved edit mode only. Immutable payload plus atomic manifest commit; no original writes. Expected-hash or request-key conflicts return 409; read-only returns 403.
+      security: [{aiBearerAuth: [], workspaceSession: []}]
+      parameters:
+        - {in: path, name: workspaceId, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [relativePath, content, requestKey]
+              properties:
+                relativePath: {type: string}
+                content: {type: string}
+                requestKey: {type: string}
+      responses:
+        '200': {description: Committed file metadata or original idempotent response.}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/workspaces/{workspaceId}/patch:
+    post:
+      operationId: applyWorkspacePatch
+      description: GUI-approved edit mode only. Immutable payload plus atomic manifest commit; no original writes. Expected-hash or request-key conflicts return 409; read-only returns 403.
+      security: [{aiBearerAuth: [], workspaceSession: []}]
+      parameters:
+        - {in: path, name: workspaceId, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [fileId, expectedHash, patch, requestKey]
+              properties:
+                fileId: {type: string}
+                expectedHash: {type: string}
+                patch: {type: string}
+                requestKey: {type: string}
+      responses:
+        '200': {description: Committed file metadata or original idempotent response.}
+        default: {$ref: '#/components/responses/Error'}
   /v1/status:
     get:
       operationId: getStatus
@@ -136,7 +256,7 @@ paths:
   /v1/pending:
     get:
       operationId: listPending
-      description: Files queued by this Mac and still waiting for the phone to fetch.
+      description: Files queued by this Mac, including undelivered AI-created library files. ACK keeps AI-created Mac library originals.
       responses:
         '200': {$ref: '#/components/responses/Items'}
         default: {$ref: '#/components/responses/Error'}
@@ -489,6 +609,15 @@ paths:
         default: {$ref: '#/components/responses/Error'}
 components:
   securitySchemes:
+    aiBearerAuth:
+      type: http
+      scheme: bearer
+      description: Separate AI token, accepted on loopback only.
+    workspaceSession:
+      type: apiKey
+      in: header
+      name: X-Workspace-Session
+      description: Server-issued pending credential bound to each workspace only by the GUI. Invalidated on app restart.
     bearerAuth:
       type: http
       scheme: bearer
@@ -544,6 +673,9 @@ components:
         createdAt: {type: number, description: Seconds since 2001-01-01 UTC.}
         savedPath: {type: string}
         saveError: {type: string}
+        phoneDeliveryPending:
+          type: boolean
+          description: Optional delivery status for AI-created ordinary library receipts. ACK clears this flag and retains the Mac original.
     UploadStatus:
       type: object
       required: [id, offset, complete]
@@ -557,19 +689,13 @@ components:
       properties:
         operation:
           type: string
-          enum: [receive, receiveAll, cancelInbox, cancelOutbox, sendText, sendFiles, importFiles, receiveTextFile]
+          enum: [receive, receiveAll, cancelInbox, cancelOutbox, sendText, receiveTextFile]
         itemIDs:
           type: array
           description: Required for receive, cancelInbox, and cancelOutbox. 1-100 UUIDs.
           minItems: 1
           maxItems: 100
           items: {type: string, format: uuid}
-        filePaths:
-          type: array
-          description: Required for sendFiles and importFiles. 1-16 absolute paths; importFiles applies the receipt settings.
-          minItems: 1
-          maxItems: 16
-          items: {type: string}
         text:
           type: string
           description: Required for sendText. At most 512 KiB of UTF-8.

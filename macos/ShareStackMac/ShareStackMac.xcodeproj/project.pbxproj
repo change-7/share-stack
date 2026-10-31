@@ -3,6 +3,8 @@
 	classes = {};
 	objectVersion = 60;
 	objects = {
+        A100000000000000000000E1 = {isa = PBXBuildFile; fileRef = A100000000000000000000E2; };
+        A100000000000000000000E2 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceStore.swift; sourceTree = "<group>"; };
 		A10000000000000000000001 = {isa = PBXBuildFile; fileRef = A10000000000000000000011; };
 		A10000000000000000000002 = {isa = PBXBuildFile; fileRef = A10000000000000000000012; };
 		A10000000000000000000003 = {isa = PBXBuildFile; fileRef = A10000000000000000000013; };
@@ -44,6 +46,7 @@
 		A10000000000000000000041 = {
 			isa = PBXGroup;
 			children = (
+                A100000000000000000000E2,
 				A10000000000000000000011,
 				A10000000000000000000012,
 				A10000000000000000000013,
@@ -62,6 +65,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                A100000000000000000000E1,
 				A10000000000000000000001,
 				A10000000000000000000002,
 				A10000000000000000000003,

@@ -13,6 +13,113 @@ struct AIExchangeRegression {
         precondition(value)
     }
 
+    @discardableResult static func allow(_ store: TransferStore, _ file: AIExchangeFile) throws -> AIExchangeFile {
+        var time: TimeInterval = 0
+        let preparation = AIReadPreparation(now: { time })
+        time = AIReadPreparation.delay
+        return try store.prepareAIRead(sourceID: nil, fileID: file.id, preparation: preparation)
+    }
+
+    static func denied(_ store: TransferStore, _ id: String) throws {
+        do { _ = try store.aiSharedFileInfo(id); fatalError("Unchecked metadata exposed") }
+        catch TransferStore.StoreError.sharedFileNotFound {}
+        do { _ = try store.readAIExchangeFile(id, offset: 0, limit: 32); fatalError("Unchecked text exposed") }
+        catch TransferStore.StoreError.sharedFileNotFound {}
+    }
+
+    static func consentRegression(_ work: URL) throws {
+        let root = work.appendingPathComponent("ConsentStore")
+        var store = try TransferStore(rootDirectory: root)
+        let file = try store.receiveExchangeTextFile(filename: "unchecked.txt", content: "private until checked", mimeType: "text/plain")
+        assert(file.aiReadAllowed == false)
+        try check(try store.aiSharedFiles(offset: 0, limit: 10).items.isEmpty)
+        try denied(store, file.id)
+        var time: TimeInterval = 0
+        let waiting = AIReadPreparation(now: { time })
+        do {
+            _ = try store.prepareAIRead(sourceID: nil, fileID: file.id, preparation: waiting)
+            fatalError("AI access enabled before grace period")
+        } catch TransferStore.StoreError.aiPreparationWaiting {}
+        waiting.cancel()
+        time = 1
+        do {
+            _ = try store.prepareAIRead(sourceID: nil, fileID: file.id, preparation: waiting)
+            fatalError("Cancelled preparation enabled AI access")
+        } catch is CancellationError {}
+        try denied(store, file.id)
+        _ = try allow(store, file)
+        try check(try store.aiSharedFileInfo(file.id).isReadable)
+        store.denyAIReadImmediately(file.id)
+        try denied(store, file.id)
+        try check(try store.aiSharedFiles(offset: 0, limit: 10).items.isEmpty)
+        try store.revokeAIRead(file.id)
+        try check(try Data(contentsOf: root.appendingPathComponent("AI Exchange/" + file.id)) == Data("private until checked".utf8))
+        let restarted = try TransferStore(rootDirectory: root)
+        try denied(restarted, file.id)
+        let staleRevoke = AIReadPreparation()
+        staleRevoke.cancel()
+        _ = try allow(restarted, file)
+        do {
+            try restarted.revokeAIRead(file.id, preparation: staleRevoke)
+            fatalError("Stale revocation overwrote a newer grant")
+        } catch is CancellationError {}
+        try check(try restarted.aiSharedFileInfo(file.id).isReadable)
+        print("PASS: default-off list/info/text, grace period, cancelled/stale intents, immediate revoke and restart persistence")
+
+        store = restarted
+        let original = try store.receiveFileData(Data(repeating: 65, count: 3 * 1024 * 1024), name: "large.txt", mimeType: "text/plain")
+        let before = store.aiExchangeItems().count
+        let cancelled = AIReadPreparation(now: { 0 })
+        do {
+            _ = try store.prepareAIRead(sourceID: original.id, fileID: nil, preparation: cancelled) { _ in cancelled.cancel() }
+            fatalError("Cancelled copy was registered")
+        } catch is CancellationError {}
+        assert(store.aiExchangeItems().count == before)
+        let files = try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("AI Exchange").path)
+        assert(!files.contains { $0.hasPrefix(".partial-") })
+        var copyTime: TimeInterval = 0
+        let request = AIReadPreparation(now: { copyTime }); copyTime = 1
+        let copy = try store.prepareAIRead(sourceID: original.id, fileID: nil, preparation: request)
+        assert(copy.sourceItemID == original.id)
+        assert(request.cancel() == copy.id)
+        store.denyAIReadImmediately(copy.id)
+        try denied(store, copy.id)
+        try store.revokeAIRead(copy.id)
+        let rows = LibraryItem.combine(inbox: store.inboxItems(), saved: [], exchange: store.aiExchangeItems())
+        assert(rows.filter { $0.id == original.id }.count == 1)
+        assert(!rows.contains { $0.id == copy.id })
+        let duplicateRows = LibraryItem.combine(inbox: [original], saved: [original], exchange: [copy])
+        assert(duplicateRows.count == 1)
+        var unrelated = file
+        unrelated.sourceItemID = original.id
+        let separateRows = LibraryItem.combine(inbox: [original], saved: [], exchange: [unrelated])
+        assert(separateRows.count == 2 && separateRows.first { $0.id == original.id }?.exchange == nil)
+        _ = try allow(store, copy)
+        assert(store.aiExchangeItems().count == before + 1)
+        try check(store.inboxItems().contains { $0.id == original.id })
+        try check(try store.readAIExchangeFile(copy.id, offset: 0, limit: 32).content == String(repeating: "A", count: 32))
+        try store.cancelReceivedItem(original.id)
+        try denied(store, copy.id)
+        assert(!store.aiExchangeItems().contains { $0.id == copy.id })
+        assert(!FileManager.default.fileExists(atPath: root.appendingPathComponent("AI Exchange/" + copy.id).path))
+        print("PASS: cancelled copy cleanup, source preservation, unique unified rows, snapshot reuse and source cancellation revokes linked copy")
+
+        let legacyRoot = work.appendingPathComponent("LegacyConsentStore")
+        let legacy = try TransferStore(rootDirectory: legacyRoot)
+        let oldFile = try legacy.receiveExchangeTextFile(filename: "old.txt", content: "legacy bytes", mimeType: "text/plain")
+        let index = legacyRoot.appendingPathComponent("AI Exchange/index.json")
+        var object = try JSONSerialization.jsonObject(with: Data(contentsOf: index)) as! [String: Any]
+        var entries = object["files"] as! [[String: Any]]
+        entries[0].removeValue(forKey: "aiReadAllowed")
+        object["files"] = entries
+        try JSONSerialization.data(withJSONObject: object).write(to: index)
+        let migrated = try TransferStore(rootDirectory: legacyRoot)
+        assert(migrated.aiExchangeItems().count == 1)
+        try denied(migrated, oldFile.id)
+        try check(try Data(contentsOf: legacyRoot.appendingPathComponent("AI Exchange/" + oldFile.id)) == Data("legacy bytes".utf8))
+        print("PASS: legacy files preserved with AI access off")
+    }
+
     static func finished(_ jobs: TransferJobs, _ request: TransferJobRequest) throws -> TransferJob {
         let submitted = try jobs.submit(request)
         for _ in 0..<1_000 {
@@ -70,6 +177,7 @@ struct AIExchangeRegression {
         assert(automaticStore.aiExchangeItems().isEmpty)
         let finderExchangeCopy = try automaticStore.addInboxFileToAIExchange(finderShare.id)
         try check(try Data(contentsOf: URL(fileURLWithPath: finderShare.savedPath!)) == Data("Finder share".utf8))
+        try allow(automaticStore, finderExchangeCopy)
         try check(try automaticStore.readAIExchangeFile(finderExchangeCopy.id, offset: 0, limit: 32).content == "Finder share")
         print("PASS: automatically saved Finder-style receipt stays unregistered until explicit copy; source is preserved")
 
@@ -90,6 +198,8 @@ struct AIExchangeRegression {
         assert(first.id != inboxMarkdown.id && second.id != inboxSRT.id)
         assert(first.id != third.id && first.name == third.name)
         assert(store.aiExchangeItems().count == 3)
+        try check(try store.aiSharedFiles(offset: 0, limit: 10).items.isEmpty)
+        for file in [first, second, third] { try denied(store, file.id); try allow(store, file) }
         let inboxFolder = URL(fileURLWithPath: store.receiptSettings().inboxFolderPath!)
         assert(fm.fileExists(atPath: inboxFolder.appendingPathComponent(inboxMarkdown.id).path))
         let exchangeDirectory = root.appendingPathComponent("AI Exchange", isDirectory: true)
@@ -114,6 +224,7 @@ struct AIExchangeRegression {
         print("PASS: explicit registration only, duplicate names keep separate copies, 0700/0600 permissions, Markdown/SRT UTF-8 chunks")
 
         let pathNamed = try store.receiveExchangeTextFile(filename: "../outside.txt", content: "exchange only", mimeType: "text/plain")
+        try allow(store, pathNamed)
         assert(pathNamed.name == "outside.txt")
         try check(try Data(contentsOf: outside) == Data("secret outside".utf8))
         try check(try store.readAIExchangeFile(pathNamed.id, offset: 0, limit: 32).content == "exchange only")
@@ -127,6 +238,7 @@ struct AIExchangeRegression {
         } catch TransferStore.StoreError.sharedFileUnavailable {}
 
         let symlinked = try store.receiveExchangeTextFile(filename: "link.txt", content: "copy", mimeType: "text/plain")
+        try allow(store, symlinked)
         let symlinkPath = exchangeDirectory.appendingPathComponent(symlinked.id)
         try fm.removeItem(at: symlinkPath)
         try fm.createSymbolicLink(at: symlinkPath, withDestinationURL: outside)
@@ -149,6 +261,7 @@ struct AIExchangeRegression {
         try check(try reloaded.readAIExchangeFile(second.id, offset: 0, limit: 32_768).content.contains("안녕 世界"))
 
         let racing = try reloaded.receiveExchangeTextFile(filename: "race.txt", content: "race", mimeType: "text/plain")
+        try allow(reloaded, racing)
         let gate = DispatchSemaphore(value: 0)
         let raceGroup = DispatchGroup()
         raceGroup.enter()
@@ -202,6 +315,7 @@ struct AIExchangeRegression {
         assert(TransferHTTPServer.caller(for: phone, phoneToken: "phone-token", aiToken: "ai-token") == .phone)
         assert(TransferHTTPServer.caller(for: ai, phoneToken: "phone-token", aiToken: "ai-token") == .aiMCP)
         assert(TransferHTTPServer.caller(for: nil, phoneToken: "phone-token", aiToken: "ai-token") == nil)
+        assert(TransferHTTPServer.mayAccess("/v1/health", caller: .aiMCP))
         assert(!TransferHTTPServer.mayAccess("/v1/shared-files", caller: .phone))
         assert(!TransferHTTPServer.mayAccess("/v1/inbox", caller: .aiMCP))
         assert(TransferHTTPServer.mayAccess("/v1/ai-exchange/text", caller: .aiMCP))
@@ -210,6 +324,7 @@ struct AIExchangeRegression {
         assert(!TransferHTTPServer.maySubmitAIJob(.sendFiles))
         assert(!TransferHTTPServer.maySubmitAIJob(.importFiles))
         assert(TransferHTTPServer.maySubmitAIJob(.receiveTextFile))
-        print("PASS: distinct phone/AI bearer principals; legacy inbox/item and arbitrary path jobs denied to AI")
+        try consentRegression(work)
+        print("PASS: authenticated AI health readiness; distinct phone/AI principals; legacy inbox/item and arbitrary path jobs denied to AI")
     }
 }

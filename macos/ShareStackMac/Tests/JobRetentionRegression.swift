@@ -2,12 +2,24 @@ import Foundation
 
 final class TransferStore {
     struct Item { let id: String }
+    private let enqueueTextStarted: DispatchSemaphore?
+    private let releaseEnqueueText: DispatchSemaphore?
+
+    init(blockingEnqueueText: (DispatchSemaphore, DispatchSemaphore)? = nil) {
+        enqueueTextStarted = blockingEnqueueText?.0
+        releaseEnqueueText = blockingEnqueueText?.1
+    }
+
     func inboxItems() -> [Item] { [] }
     func acceptReceivedItem(_ id: String) throws -> Item { Item(id: id) }
     func cancelReceivedItem(_ id: String) throws {}
     func cancelOutgoingItem(_ id: String) throws {}
-    func enqueueText(_ text: String) throws -> Item { Item(id: text) }
-    func receiveFileData(_ data: Data, name: String, mimeType: String) throws -> Item { Item(id: name) }
+    func enqueueText(_ text: String) throws -> Item {
+        enqueueTextStarted?.signal()
+        if let releaseEnqueueText { releaseEnqueueText.wait() }
+        return Item(id: text)
+    }
+    func receiveFileData(_ data: Data, name: String, mimeType: String, phoneDeliveryPending: Bool = false) throws -> Item { Item(id: name) }
     func importReceivedFile(_ url: URL, mimeType: String) throws -> Item { Item(id: url.path) }
     func enqueueFile(_ url: URL, mimeType: String) throws -> Item { Item(id: url.path) }
 }
@@ -37,6 +49,15 @@ struct JobRetentionRegression {
         catch { fatalError("Unexpected error: \(error)") }
     }
 
+    static func waitForTerminal(_ jobs: TransferJobs, _ id: String) throws -> TransferJob {
+        for _ in 0..<1_000 {
+            let job = try jobs.get(id)
+            if job.terminal { return job }
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        fatalError("Cancelled job did not finish")
+    }
+
     static func main() throws {
         let clock = Clock()
         let jobs = TransferJobs(store: TransferStore(), now: clock.now)
@@ -63,6 +84,17 @@ struct JobRetentionRegression {
         }
         let failed = try finished(jobs, TransferJobRequest(operation: .sendFiles, filePaths: ["/nonexistent/sharestack-retention-test"]))
         assert(failed.status == "failed" && failed.failures.count == 1)
+
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let blockedJobs = TransferJobs(store: TransferStore(blockingEnqueueText: (started, release)))
+        let active = try blockedJobs.submit(request)
+        precondition(started.wait(timeout: .now() + 2) == .success)
+        let cancellation = try blockedJobs.cancel(active.id)
+        assert(cancellation.status == "cancelling")
+        release.signal()
+        let finalState = try waitForTerminal(blockedJobs, active.id)
+        assert(finalState.status == "cancelled")
         clock.advance(600)
         missing(jobs, failed.id)
         print("PASS: success/failure retention, terminal cancellation, 600-second expiry and 20-job limit")

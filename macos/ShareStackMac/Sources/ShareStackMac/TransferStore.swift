@@ -14,6 +14,7 @@ struct TransferItem: Codable, Identifiable, Sendable, Equatable {
     var savedPath: String?
     var saveError: String?
     var isShared: Bool? = nil
+    var phoneDeliveryPending: Bool? = nil
 }
 
 struct SharedFileSummary: Encodable {
@@ -61,14 +62,115 @@ struct AIExchangeFile: Codable, Identifiable, Sendable, Equatable {
     let size: Int64
     let sha256: String
     let createdAt: Date
+    var aiReadAllowed: Bool? = nil
+    var sourceItemID: String? = nil
+    var phoneDeliveryPending: Bool? = nil
+}
+
+struct LibraryItem: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let mimeType: String
+    let size: Int64
+    let createdAt: Date
+    let transfer: TransferItem?
+    let exchange: AIExchangeFile?
+
+    static func combine(inbox: [TransferItem], saved: [TransferItem], exchange: [AIExchangeFile]) -> [LibraryItem] {
+        var transfersByID: [String: TransferItem] = [:]
+        for item in inbox + saved { transfersByID[item.id] = item }
+        let transfers = Array(transfersByID.values)
+        var copiesBySource: [String: [AIExchangeFile]] = [:]
+        for file in exchange {
+            if let sourceID = file.sourceItemID { copiesBySource[sourceID, default: []].append(file) }
+        }
+        var linkedCopyIDs = Set<String>()
+        let transferRows = transfers.map { item in
+            let copy = copiesBySource[item.id]?.first { $0.sha256 == item.sha256 && $0.size == item.size }
+            if let copy { linkedCopyIDs.insert(copy.id) }
+            return LibraryItem(id: item.id, name: item.name, mimeType: item.mimeType, size: item.size,
+                               createdAt: item.createdAt, transfer: item, exchange: copy)
+        }
+        let rows = transferRows + exchange.filter { !linkedCopyIDs.contains($0.id) }.map { file in
+            LibraryItem(id: file.id, name: file.name, mimeType: file.mimeType, size: file.size,
+                        createdAt: file.createdAt, transfer: nil, exchange: file)
+        }
+        return rows.sorted { $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt > $1.createdAt }
+    }
+}
+
+final class AIReadPreparation: @unchecked Sendable {
+    static let delay: TimeInterval = 0.7
+    private let lock = NSLock()
+    private let now: () -> TimeInterval
+    private let deadline: TimeInterval
+    private var cancelled = false
+    private var committedID: String?
+    let permissionKey: String?
+    let permissionRevision: UInt64
+
+    init(now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         permissionKey: String? = nil, permissionRevision: UInt64 = 0) {
+        self.permissionKey = permissionKey
+        self.permissionRevision = permissionRevision
+        self.now = now
+        deadline = now() + Self.delay
+    }
+
+    func check() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        if cancelled { throw CancellationError() }
+    }
+
+    @discardableResult func cancel() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        cancelled = true
+        return committedID
+    }
+
+    func whileCurrent(_ body: () throws -> Void) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { throw CancellationError() }
+        try body()
+    }
+
+    func commit(_ body: () throws -> AIExchangeFile, requireDelay: Bool = true) throws -> AIExchangeFile {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { throw CancellationError() }
+        guard !requireDelay || now() >= deadline else { throw TransferStore.StoreError.aiPreparationWaiting }
+        let file = try body()
+        committedID = file.id
+        return file
+    }
+}
+
+struct PhoneAIReadRequest: Codable, Equatable {
+    let id: String
+    let revision: Int64
+    let allowed: Bool
+    var sourceID: String?
+    var sha256: String?
+    var locallyRevoked: Bool? = nil
+}
+
+struct PhoneAIReadStatus: Encodable {
+    let id: String
+    let revision: Int64
+    let allowed: Bool
+    let ready: Bool
 }
 
 private struct AIExchangeIndex: Codable {
     var aiReadEnabled = true
     var files: [AIExchangeFile] = []
     var retiredIDs: Set<String> = []
+    var phoneIntents: [String: PhoneAIReadRequest] = [:]
 
-    private enum CodingKeys: String, CodingKey { case aiReadEnabled, files, retiredIDs }
+    private enum CodingKeys: String, CodingKey { case aiReadEnabled, files, retiredIDs, phoneIntents }
 
     init() {}
 
@@ -77,6 +179,7 @@ private struct AIExchangeIndex: Codable {
         aiReadEnabled = try values.decodeIfPresent(Bool.self, forKey: .aiReadEnabled) ?? true
         files = try values.decodeIfPresent([AIExchangeFile].self, forKey: .files) ?? []
         retiredIDs = try values.decodeIfPresent(Set<String>.self, forKey: .retiredIDs) ?? []
+        phoneIntents = try values.decodeIfPresent([String: PhoneAIReadRequest].self, forKey: .phoneIntents) ?? [:]
     }
 }
 
@@ -137,6 +240,9 @@ struct UploadRange {
     var length: Int64 { end - start + 1 }
 
     static func parse(_ value: String, fileSize: Int64? = nil) -> UploadRange? {
+        if let fileSize, value.hasPrefix("bytes=") {
+            return parse("bytes \(value.dropFirst(6))/\(fileSize)")
+        }
         guard value.hasPrefix("bytes ") else { return nil }
         let parts = value.dropFirst(6).split(separator: "/", omittingEmptySubsequences: false)
         guard parts.count == 2, let total = Int64(parts[1]), total > 0,
@@ -146,6 +252,64 @@ struct UploadRange {
               start >= 0, end >= start, end < total else { return nil }
         return UploadRange(start: start, end: end, total: total)
     }
+}
+
+final class UploadChunkWriter: @unchecked Sendable {
+    private let store: TransferStore
+    private let id: String
+    private let range: UploadRange
+    private let handle: FileHandle
+    private let lock = NSLock()
+    private var written: Int64 = 0
+    private var closed = false
+
+    fileprivate init(store: TransferStore, id: String, range: UploadRange, handle: FileHandle) {
+        self.store = store
+        self.id = id
+        self.range = range
+        self.handle = handle
+    }
+
+    func append(_ data: Data) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed, !data.isEmpty, Int64(data.count) <= range.length - written else {
+            throw TransferStore.StoreError.invalidUploadRange
+        }
+        try handle.write(contentsOf: data)
+        written += Int64(data.count)
+    }
+
+    func finish() throws -> UploadStatus {
+        lock.lock()
+        guard !closed, written == range.length else {
+            lock.unlock()
+            throw TransferStore.StoreError.invalidUploadRange
+        }
+        do {
+            try handle.close()
+        } catch {
+            closed = true
+            lock.unlock()
+            store.cancelUploadChunk(id)
+            throw error
+        }
+        closed = true
+        lock.unlock()
+        store.finishUploadChunk(id)
+        return UploadStatus(id: id, offset: range.end + 1, complete: false)
+    }
+
+    func cancel() {
+        lock.lock()
+        guard !closed else { lock.unlock(); return }
+        closed = true
+        try? handle.close()
+        lock.unlock()
+        store.cancelUploadChunk(id)
+    }
+
+    deinit { cancel() }
 }
 
 // Mutable state is protected by lock; file paths and FileManager are shared safely across queues.
@@ -176,8 +340,15 @@ final class TransferStore: @unchecked Sendable {
     private let settingsURL: URL
     private var items: [TransferItem]
     private var uploads: [String: UploadSession]
+    private var activeUploadChunks = Set<String>()
     private var settings: ReceiptSettings
     private var aiExchangeIndex: AIExchangeIndex
+    private let phoneIntentLock = NSLock()
+    private var phonePreparations: [String: AIReadPreparation] = [:]
+    private let aiPermissionLock = NSLock()
+    private var deniedAIIDs = Set<String>()
+    private var aiReadSources: [String: String] = [:]
+    private var aiReadRevisions: [String: UInt64] = [:]
     private var verifiedExchangeFiles: [String: ExchangeFingerprint] = [:]
     private let eventStreamID = UUID().uuidString.lowercased()
     private var events: [TransferEvent] = []
@@ -247,6 +418,7 @@ final class TransferStore: @unchecked Sendable {
         where file.lastPathComponent.contains(".finalizing-") {
             try? fileManager.removeItem(at: file)
         }
+        for file in aiExchangeIndex.files { aiReadSources[file.id] = file.sourceItemID ?? file.id }
         pruneStaleUploads()
         pruneExchangeOrphans()
     }
@@ -294,13 +466,16 @@ final class TransferStore: @unchecked Sendable {
         return url
     }
 
-    func saveReceivedFile(_ temporaryFile: URL, name: String, mimeType: String, expectedSHA256: String) throws -> TransferItem {
+    func saveReceivedFile(_ temporaryFile: URL, name: String, mimeType: String, expectedSHA256: String,
+                          phoneDeliveryPending: Bool = false) throws -> TransferItem {
         try saveReceivedFile(temporaryFile, name: name, mimeType: mimeType,
-                             expectedSHA256: expectedSHA256, computedSHA256: nil, receivedAt: Date())
+                             expectedSHA256: expectedSHA256, computedSHA256: nil, receivedAt: Date(),
+                             phoneDeliveryPending: phoneDeliveryPending)
     }
 
     private func saveReceivedFile(_ temporaryFile: URL, name: String, mimeType: String,
-                                  expectedSHA256: String, computedSHA256: String?, receivedAt: Date) throws -> TransferItem {
+                                  expectedSHA256: String, computedSHA256: String?, receivedAt: Date,
+                                  phoneDeliveryPending: Bool = false) throws -> TransferItem {
         guard expectedSHA256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else {
             try? fileManager.removeItem(at: temporaryFile)
             throw StoreError.checksumMismatch
@@ -324,10 +499,17 @@ final class TransferStore: @unchecked Sendable {
         defer { lock.unlock() }
         if let duplicate = receivedItemLocked(sha256: sha256) {
             try? fileManager.removeItem(at: temporaryFile)
+            if phoneDeliveryPending, let index = items.firstIndex(where: { $0.id == duplicate.id }) {
+                items[index].phoneDeliveryPending = true
+                do { try persist() }
+                catch { items[index] = duplicate; throw error }
+                return items[index]
+            }
             return duplicate
         }
         return try insertReceivedLocked(temporaryFile, name: name, mimeType: mimeType,
-                                        size: size, sha256: sha256, receivedAt: receivedAt)
+                                        size: size, sha256: sha256, receivedAt: receivedAt,
+                                        phoneDeliveryPending: phoneDeliveryPending)
     }
 
     func beginUpload(_ session: UploadSession) throws -> UploadStatus {
@@ -336,7 +518,8 @@ final class TransferStore: @unchecked Sendable {
         guard session.id == session.sha256,
               session.id.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
               session.size >= 0, session.size <= Self.maximumItemSize,
-              !session.name.isEmpty, !session.mimeType.isEmpty else { throw StoreError.invalidUpload }
+              !session.name.isEmpty, !session.mimeType.isEmpty,
+              !activeUploadChunks.contains(session.id) else { throw StoreError.invalidUpload }
         if let existing = receivedItemLocked(sha256: session.sha256) {
             try removeUploadLocked(session.id)
             return UploadStatus(id: session.id, offset: existing.size, complete: true)
@@ -369,30 +552,44 @@ final class TransferStore: @unchecked Sendable {
         return UploadStatus(id: session.id, offset: offset, complete: false)
     }
 
-    func appendUploadChunk(_ id: String, range: UploadRange, data: Data) throws -> UploadStatus {
+    func beginUploadChunk(_ id: String, range: UploadRange) throws -> UploadChunkWriter {
         lock.lock()
         defer { lock.unlock() }
-        guard let session = uploads[id], !data.isEmpty,
-              range.total == session.size, range.start >= 0, range.start <= session.size,
+        guard let session = uploads[id], range.total == session.size, range.start >= 0,
               range.end >= range.start, range.end < session.size,
-              range.length == Int64(data.count) else { throw StoreError.invalidUploadRange }
+              !activeUploadChunks.contains(id) else { throw StoreError.invalidUploadRange }
         let partial = uploadURL(id)
         guard try Self.fileSize(partial) == range.start else { throw StoreError.invalidUploadRange }
         let handle = try FileHandle(forWritingTo: partial)
         do {
             try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-            try handle.close()
         } catch {
             try? handle.close()
             throw error
         }
-        return UploadStatus(id: id, offset: range.start + Int64(data.count), complete: false)
+        activeUploadChunks.insert(id)
+        return UploadChunkWriter(store: self, id: id, range: range, handle: handle)
+    }
+
+    fileprivate func finishUploadChunk(_ id: String) {
+        lock.lock()
+        activeUploadChunks.remove(id)
+        lock.unlock()
+    }
+
+    fileprivate func cancelUploadChunk(_ id: String) {
+        lock.lock()
+        activeUploadChunks.remove(id)
+        lock.unlock()
     }
 
     func finishUpload(_ id: String) throws -> TransferItem {
         let partial = uploadURL(id)
         lock.lock()
+        guard !activeUploadChunks.contains(id) else {
+            lock.unlock()
+            throw StoreError.invalidUploadRange
+        }
         if let existing = receivedItemLocked(sha256: id) {
             try? removeUploadLocked(id)
             lock.unlock()
@@ -447,7 +644,8 @@ final class TransferStore: @unchecked Sendable {
     }
 
     private func insertReceivedLocked(_ temporaryFile: URL, name: String, mimeType: String,
-                                      size: Int64, sha256: String, receivedAt: Date = Date()) throws -> TransferItem {
+                                      size: Int64, sha256: String, receivedAt: Date = Date(),
+                                      phoneDeliveryPending: Bool = false) throws -> TransferItem {
         guard Self.isRegularDirectoryWithoutSymlink(inboxURL) else { throw StoreError.invalidTemporaryFolder }
         let id = UUID().uuidString.lowercased()
         let destination = inboxURL.appendingPathComponent(id)
@@ -461,7 +659,8 @@ final class TransferStore: @unchecked Sendable {
             origin: "galaxy",
             state: "awaitingAcceptance",
             createdAt: receivedAt,
-            isShared: true
+            isShared: true,
+            phoneDeliveryPending: phoneDeliveryPending ? true : nil
         )
         items.insert(item, at: 0)
         do {
@@ -673,15 +872,30 @@ final class TransferStore: @unchecked Sendable {
     func cancelReceivedItem(_ id: String) throws {
         lock.lock()
         defer { lock.unlock() }
-        guard let index = items.firstIndex(where: { $0.id == id && Self.isAwaitingAcceptance($0) }) else {
+        guard let index = items.firstIndex(where: { $0.id == id && (Self.isAwaitingAcceptance($0) || ($0.origin == "galaxy" && $0.state == "saved" && $0.isShared == true)) }) else {
             throw StoreError.itemNotInInbox
         }
-        try removeItemLocked(at: index, eventType: "file.cancelled")
+        let linked = aiExchangeIndex.files.filter { $0.sourceItemID == id }.map(\.id)
+        for fileID in linked { denyAIReadImmediately(fileID) }
+        if items[index].state == "saved" {
+            let previous = items[index]
+            items[index].isShared = false
+            items[index].phoneDeliveryPending = false
+            do { try persist() } catch { items[index] = previous; throw error }
+            recordEventLocked("file.removed", itemID: id)
+        } else {
+            try removeItemLocked(at: index, eventType: "file.cancelled")
+        }
+        for fileID in linked { try deleteAIExchangeFileLocked(fileID) }
     }
 
     func cancelOutgoingItem(_ id: String) throws {
         lock.lock()
         defer { lock.unlock() }
+        if try finishLibraryPhoneDeliveryLocked(id) {
+            recordEventLocked("outbox.cancelled", itemID: id)
+            return
+        }
         guard let index = items.firstIndex(where: { $0.id == id && $0.origin == "mac" && $0.state == "pending" }) else {
             throw StoreError.itemNotPending
         }
@@ -776,13 +990,15 @@ final class TransferStore: @unchecked Sendable {
         }
     }
 
-    func receiveFileData(_ data: Data, name: String, mimeType: String) throws -> TransferItem {
+    func receiveFileData(_ data: Data, name: String, mimeType: String,
+                         phoneDeliveryPending: Bool = false) throws -> TransferItem {
         guard Int64(data.count) <= Self.maximumItemSize else { throw StoreError.itemTooLarge }
         let temporary = try makeTemporaryFile()
         do {
             try data.write(to: temporary, options: .atomic)
             let checksum = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-            return try saveReceivedFile(temporary, name: name, mimeType: mimeType, expectedSHA256: checksum)
+            return try saveReceivedFile(temporary, name: name, mimeType: mimeType, expectedSHA256: checksum,
+                                        phoneDeliveryPending: phoneDeliveryPending)
         } catch {
             try? fileManager.removeItem(at: temporary)
             throw error
@@ -841,16 +1057,53 @@ final class TransferStore: @unchecked Sendable {
         return item
     }
 
+    func queueLibraryItemForPhone(_ id: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        if let index = items.firstIndex(where: { $0.id == id && $0.origin == "galaxy" }) {
+            guard sharedFileURL(items[index]) != nil else { throw StoreError.sharedFileUnavailable }
+            let previous = items[index]
+            items[index].phoneDeliveryPending = true
+            do { try persist() } catch { items[index] = previous; throw error }
+            return
+        }
+        if let index = aiExchangeIndex.files.firstIndex(where: { $0.id == id && $0.sourceItemID == nil }) {
+            guard Self.exchangeFileExists(aiExchangeIndex.files[index], directory: aiExchangeURL) else { throw StoreError.sharedFileUnavailable }
+            let previous = aiExchangeIndex.files[index]
+            aiExchangeIndex.files[index].phoneDeliveryPending = true
+            do { try persistAIExchangeIndexLocked() } catch { aiExchangeIndex.files[index] = previous; throw error }
+            return
+        }
+        throw StoreError.sharedFileNotFound
+    }
+
     func pendingForGalaxy() -> [TransferItem] {
         lock.lock()
         defer { lock.unlock() }
-        return items.filter { $0.origin == "mac" && $0.state == "pending" }
+        let transfers = items.filter {
+            $0.origin == "mac" && $0.state == "pending" ||
+                $0.phoneDeliveryPending == true && sharedFileURL($0) != nil
+        }
+        let exchange = aiExchangeIndex.files.filter(isPendingPhoneDelivery).map(Self.phoneTransferItem)
+        return (transfers + exchange).sorted { $0.createdAt > $1.createdAt }
+    }
+
+    private func isPendingPhoneDelivery(_ file: AIExchangeFile) -> Bool {
+        file.sourceItemID == nil && file.phoneDeliveryPending != false && Self.exchangeFileExists(file, directory: aiExchangeURL)
+    }
+
+    private static func phoneTransferItem(_ file: AIExchangeFile) -> TransferItem {
+        TransferItem(id: file.id, name: file.name, mimeType: file.mimeType, size: file.size,
+                     sha256: file.sha256, origin: "mac", state: "pending", createdAt: file.createdAt)
     }
 
     func fileURL(for id: String) -> URL? {
         lock.lock()
         defer { lock.unlock() }
-        guard let item = items.first(where: { $0.id == id }) else { return nil }
+        guard let item = items.first(where: { $0.id == id }) else {
+            guard let file = aiExchangeIndex.files.first(where: { $0.id == id && isPendingPhoneDelivery($0) }) else { return nil }
+            return aiExchangeURL.appendingPathComponent(file.id)
+        }
         let url = storedURL(item)
         return fileManager.fileExists(atPath: url.path) ? url : nil
     }
@@ -858,7 +1111,8 @@ final class TransferStore: @unchecked Sendable {
     func item(for id: String) -> TransferItem? {
         lock.lock()
         defer { lock.unlock() }
-        return items.first { $0.id == id && $0.state != "saved" && $0.state != "delivered" }
+        if let item = items.first(where: { $0.id == id && ($0.phoneDeliveryPending == true || $0.state != "saved" && $0.state != "delivered") }) { return item }
+        return aiExchangeIndex.files.first { $0.id == id && isPendingPhoneDelivery($0) }.map(Self.phoneTransferItem)
     }
 
     func sharedFiles(offset: Int, limit: Int) -> SharedFilePage {
@@ -926,6 +1180,10 @@ final class TransferStore: @unchecked Sendable {
                                bytesRead: bytesRead, sizeBytes: size, hasMore: next < size)
     }
 
+    func workspaceStore() throws -> WorkspaceStore {
+        try WorkspaceStore(root: root.appendingPathComponent("Workspaces", isDirectory: true), enabled: { [weak self] in self?.aiExchangeEnabled() ?? false })
+    }
+
     func aiExchangeEnabled() -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -960,17 +1218,267 @@ final class TransferStore: @unchecked Sendable {
     }
 
     func addInboxFileToAIExchange(_ id: String) throws -> AIExchangeFile {
+        let item = try exchangeSource(id)
+        return try registerAIExchangeFile(name: item.0.name, mimeType: item.0.mimeType,
+                                          sourceURL: item.1, expectedSize: item.0.size,
+                                          expectedSHA256: item.0.sha256, sourceItemID: id)
+    }
+
+    private func exchangeSource(_ id: String) throws -> (TransferItem, URL) {
         lock.lock()
         defer { lock.unlock() }
         guard let item = items.first(where: {
             $0.id == id && $0.origin == "galaxy" &&
                 (Self.isAwaitingAcceptance($0) || $0.state == "saved" && $0.isShared == true)
-        }) else {
-            throw StoreError.itemNotInInbox
+        }) else { throw StoreError.itemNotInInbox }
+        return (item, storedURL(item))
+    }
+
+    func makeAIReadPreparation(sourceID: String?, fileID: String?) -> AIReadPreparation {
+        aiPermissionLock.lock()
+        defer { aiPermissionLock.unlock() }
+        let key = sourceID ?? fileID.map { aiReadSources[$0] ?? $0 }
+        return AIReadPreparation(permissionKey: key, permissionRevision: key.map { aiReadRevisions[$0, default: 0] } ?? 0)
+    }
+
+    func invalidateAIReadPreparation(sourceID: String) {
+        aiPermissionLock.lock()
+        aiReadRevisions[sourceID, default: 0] += 1
+        aiPermissionLock.unlock()
+    }
+
+    func denyAIReadImmediately(_ id: String) {
+        aiPermissionLock.lock()
+        let id = id.lowercased()
+        deniedAIIDs.insert(id)
+        aiReadRevisions[aiReadSources[id] ?? id, default: 0] += 1
+        aiPermissionLock.unlock()
+    }
+
+    // Called with aiPermissionLock held through the grant's durable commit.
+    private func validateAIPreparationLocked(_ preparation: AIReadPreparation) throws {
+        if let key = preparation.permissionKey, aiReadRevisions[key, default: 0] != preparation.permissionRevision {
+            throw CancellationError()
         }
-        return try registerAIExchangeFileLocked(name: item.name, mimeType: item.mimeType,
-                                                sourceURL: storedURL(item), expectedSize: item.size,
-                                                expectedSHA256: item.sha256)
+    }
+
+    private func isAIDenied(_ id: String) -> Bool {
+        aiPermissionLock.lock()
+        defer { aiPermissionLock.unlock() }
+        return deniedAIIDs.contains(id.lowercased())
+    }
+
+    func revokeAIRead(_ id: String, preparation: AIReadPreparation? = nil) throws {
+        if preparation == nil { denyAIReadImmediately(id) }
+        func commit() throws -> AIExchangeFile {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let index = aiExchangeIndex.files.firstIndex(where: { $0.id == id.lowercased() }) else {
+                throw StoreError.sharedFileNotFound
+            }
+            denyAIReadImmediately(id)
+            aiExchangeIndex.files[index].aiReadAllowed = false
+            markPhoneConsentRevokedLocked(sourceID: aiExchangeIndex.files[index].sourceItemID)
+            verifiedExchangeFiles.removeValue(forKey: id.lowercased())
+            try persistAIExchangeIndexLocked()
+            return aiExchangeIndex.files[index]
+        }
+        if let preparation { _ = try preparation.commit(commit, requireDelay: false) }
+        else { _ = try commit() }
+    }
+
+    private func markPhoneConsentRevokedLocked(sourceID: String?) {
+        guard let sourceID else { return }
+        for id in Array(aiExchangeIndex.phoneIntents.keys) where aiExchangeIndex.phoneIntents[id]?.sourceID == sourceID {
+            aiExchangeIndex.phoneIntents[id]?.locallyRevoked = true
+        }
+    }
+
+    func revokePhoneConsentFromMac(sourceID: String, preparation: AIReadPreparation) throws {
+        try preparation.whileCurrent {
+            lock.lock()
+            defer { lock.unlock() }
+            invalidateAIReadPreparation(sourceID: sourceID)
+            markPhoneConsentRevokedLocked(sourceID: sourceID)
+            try persistAIExchangeIndexLocked()
+        }
+    }
+
+    private func requireAIRead(_ id: String) throws {
+        guard !isAIDenied(id) else { throw StoreError.sharedFileNotFound }
+        lock.lock()
+        defer { lock.unlock() }
+        guard aiExchangeIndex.aiReadEnabled else { throw StoreError.aiExchangeDisabled }
+        guard aiExchangeIndex.files.contains(where: { $0.id == id && $0.aiReadAllowed == true }) else {
+            throw StoreError.sharedFileNotFound
+        }
+    }
+
+    func prepareAIRead(sourceID: String?, fileID: String?, preparation: AIReadPreparation,
+                       progress: (Double) -> Void = { _ in }) throws -> AIExchangeFile {
+        try preparation.check()
+        if let fileID {
+            lock.lock()
+            let candidate = aiExchangeIndex.files.first { $0.id == fileID }
+            lock.unlock()
+            guard var file = candidate else { throw StoreError.sharedFileNotFound }
+            if let sourceID {
+                let source = try exchangeSource(sourceID).0
+                guard file.sourceItemID == sourceID, file.sha256 == source.sha256, file.size == source.size else {
+                    throw StoreError.sharedFileUnavailable
+                }
+            }
+            let directory = try openAIExchangeDirectory()
+            defer { close(directory) }
+            let descriptor = openat(directory, file.id, O_RDONLY | O_NOFOLLOW)
+            guard descriptor >= 0 else { throw StoreError.sharedFileNotFound }
+            defer { close(descriptor) }
+            var info = stat()
+            guard fstat(descriptor, &info) == 0, Self.validExchangeFile(info, size: file.size),
+                  try Self.sha256(descriptor, checkpoint: { try preparation.check() }, progress: {
+                      progress(file.size == 0 ? 1 : Double($0) / Double(file.size))
+                  }) == file.sha256 else { throw StoreError.sharedFileUnavailable }
+            var after = stat()
+            guard fstat(descriptor, &after) == 0,
+                  Self.exchangeFingerprint(info) == Self.exchangeFingerprint(after) else {
+                throw StoreError.sharedFileUnavailable
+            }
+            return try preparation.commit {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                self.aiPermissionLock.lock()
+                defer { self.aiPermissionLock.unlock() }
+                try self.validateAIPreparationLocked(preparation)
+                guard let index = self.aiExchangeIndex.files.firstIndex(where: { $0.id == fileID }) else {
+                    throw StoreError.sharedFileNotFound
+                }
+                file.aiReadAllowed = true
+                self.aiExchangeIndex.files[index] = file
+                do { try self.persistAIExchangeIndexLocked() }
+                catch { self.aiExchangeIndex.files[index].aiReadAllowed = false; throw error }
+                self.verifiedExchangeFiles[fileID] = Self.exchangeFingerprint(after)
+                self.deniedAIIDs.remove(fileID)
+                return file
+            }
+        }
+        guard let sourceID else { throw StoreError.itemNotInInbox }
+        let source = try exchangeSource(sourceID)
+        return try registerAIExchangeFile(name: source.0.name, mimeType: source.0.mimeType,
+                                          sourceURL: source.1, expectedSize: source.0.size,
+                                          expectedSHA256: source.0.sha256, sourceItemID: sourceID,
+                                          preparation: preparation, progress: progress)
+    }
+
+    // Phone revisions survive restart, including revokes received before an upload/grant.
+    func applyPhoneAIRead(_ request: PhoneAIReadRequest,
+                          progress: (Double) -> Void = { _ in }) throws -> PhoneAIReadStatus {
+        guard UUID(uuidString: request.id) != nil, request.id == request.id.lowercased(),
+              request.revision > 0,
+              !request.allowed || (request.sourceID.flatMap(UUID.init(uuidString:)) != nil &&
+                  request.sha256?.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil) else {
+            throw StoreError.invalidExchangeInput
+        }
+        let preparation: AIReadPreparation
+        let sourceID: String?
+        let fileID: String?
+        phoneIntentLock.lock()
+        do {
+            lock.lock()
+            let previous = aiExchangeIndex.phoneIntents[request.id]
+            lock.unlock()
+            if let previous, request.revision < previous.revision {
+                let status = phoneAIReadStatus(previous)
+                phoneIntentLock.unlock()
+                return status
+            }
+            if let previous, request.revision == previous.revision {
+                guard request.allowed == previous.allowed,
+                      !request.allowed || request.sourceID == previous.sourceID && request.sha256 == previous.sha256 else {
+                    throw StoreError.invalidExchangeInput
+                }
+            }
+            if let previous, request.revision == previous.revision, previous.locallyRevoked == true {
+                let status = phoneAIReadStatus(previous)
+                phoneIntentLock.unlock()
+                return status
+            }
+            if request.allowed {
+                if let bound = previous?.sourceID {
+                    guard bound == request.sourceID, previous?.sha256 == request.sha256 else {
+                        throw StoreError.invalidExchangeInput
+                    }
+                }
+                let source = try exchangeSource(request.sourceID!).0
+                guard source.sha256 == request.sha256 else { throw StoreError.checksumMismatch }
+            }
+            let committedID = phonePreparations.removeValue(forKey: request.id)?.cancel()
+            var stored = request
+            stored.locallyRevoked = nil
+            if !request.allowed {
+                stored.sourceID = previous?.sourceID
+                stored.sha256 = previous?.sha256
+            }
+            sourceID = stored.sourceID
+            lock.lock()
+            // A local revoke may have completed while cancelling the previous preparation.
+            if let latest = aiExchangeIndex.phoneIntents[request.id],
+               latest.revision == request.revision, latest.locallyRevoked == true {
+                lock.unlock()
+                let status = phoneAIReadStatus(latest)
+                phoneIntentLock.unlock()
+                return status
+            }
+            fileID = aiExchangeIndex.files.first { $0.sourceItemID == sourceID && sourceID != nil }?.id
+            preparation = makeAIReadPreparation(sourceID: sourceID, fileID: fileID)
+            aiExchangeIndex.phoneIntents[request.id] = stored
+            if !request.allowed {
+                if let sourceID { invalidateAIReadPreparation(sourceID: sourceID) }
+                for index in aiExchangeIndex.files.indices where
+                    aiExchangeIndex.files[index].id == committedID ||
+                    (sourceID != nil && aiExchangeIndex.files[index].sourceItemID == sourceID) {
+                    let id = aiExchangeIndex.files[index].id
+                    denyAIReadImmediately(id)
+                    aiExchangeIndex.files[index].aiReadAllowed = false
+                    verifiedExchangeFiles.removeValue(forKey: id)
+                }
+            }
+            do { try persistAIExchangeIndexLocked() }
+            catch {
+                if request.allowed { aiExchangeIndex.phoneIntents[request.id] = previous }
+                lock.unlock()
+                throw error
+            }
+            lock.unlock()
+            if request.allowed { phonePreparations[request.id] = preparation }
+            phoneIntentLock.unlock()
+        } catch {
+            phoneIntentLock.unlock()
+            throw error
+        }
+        guard request.allowed else { return phoneAIReadStatus(request) }
+        defer {
+            phoneIntentLock.lock()
+            if phonePreparations[request.id] === preparation { phonePreparations.removeValue(forKey: request.id) }
+            phoneIntentLock.unlock()
+        }
+        Thread.sleep(forTimeInterval: AIReadPreparation.delay)
+        _ = try prepareAIRead(sourceID: sourceID, fileID: fileID, preparation: preparation, progress: progress)
+        phoneIntentLock.lock()
+        defer { phoneIntentLock.unlock() }
+        lock.lock()
+        let latest = aiExchangeIndex.phoneIntents[request.id]!
+        lock.unlock()
+        return phoneAIReadStatus(latest)
+    }
+
+    private func phoneAIReadStatus(_ request: PhoneAIReadRequest) -> PhoneAIReadStatus {
+        lock.lock()
+        defer { lock.unlock() }
+        let allowed = request.allowed && request.locallyRevoked != true
+        let ready = allowed && aiExchangeIndex.aiReadEnabled && aiExchangeIndex.files.contains {
+            $0.sourceItemID == request.sourceID && $0.aiReadAllowed == true && !isAIDenied($0.id)
+        }
+        return PhoneAIReadStatus(id: request.id, revision: request.revision, allowed: allowed, ready: ready)
     }
 
     func receiveExchangeTextFile(filename: String, content: String, mimeType: String) throws -> AIExchangeFile {
@@ -978,29 +1486,35 @@ final class TransferStore: @unchecked Sendable {
         guard !filename.isEmpty, filename.utf8.count <= 1024, data.count <= 128 * 1024 else {
             throw StoreError.invalidExchangeInput
         }
-        lock.lock()
-        defer { lock.unlock() }
-        return try registerAIExchangeFileLocked(name: filename, mimeType: mimeType, data: data)
+        return try registerAIExchangeFile(name: filename, mimeType: mimeType, data: data)
     }
 
     func deleteAIExchangeFile(_ id: String) throws {
+        denyAIReadImmediately(id)
         guard UUID(uuidString: id) != nil else { throw StoreError.sharedFileNotFound }
         lock.lock()
         defer { lock.unlock() }
-        guard let index = aiExchangeIndex.files.firstIndex(where: { $0.id == id.lowercased() }) else {
+        try deleteAIExchangeFileLocked(id.lowercased())
+    }
+
+    private func deleteAIExchangeFileLocked(_ id: String) throws {
+        guard let index = aiExchangeIndex.files.firstIndex(where: { $0.id == id }) else {
             throw StoreError.sharedFileNotFound
         }
+        denyAIReadImmediately(id)
         let file = aiExchangeIndex.files.remove(at: index)
         aiExchangeIndex.retiredIDs.insert(file.id)
         verifiedExchangeFiles.removeValue(forKey: file.id)
+        var persistenceError: Error?
         do { try persistAIExchangeIndexLocked() }
-        catch { throw StoreError.exchangeUnavailable }
+        catch { persistenceError = error }
         let directory = try openAIExchangeDirectory()
         defer { close(directory) }
         if unlinkat(directory, file.id, 0) != 0, errno != ENOENT {
             throw StoreError.exchangeDeleteFailed
         }
         guard fsync(directory) == 0 else { throw StoreError.exchangeDeleteFailed }
+        if let persistenceError { throw persistenceError }
     }
 
     func aiSharedFiles(offset: Int, limit: Int) throws -> SharedFilePage {
@@ -1008,7 +1522,7 @@ final class TransferStore: @unchecked Sendable {
         defer { lock.unlock() }
         guard aiExchangeIndex.aiReadEnabled else { throw StoreError.aiExchangeDisabled }
         guard offset >= 0, limit > 0, limit <= 100 else { throw StoreError.invalidSharedFileRange }
-        let files = aiExchangeIndex.files.filter { Self.exchangeFileExists($0, directory: aiExchangeURL) }
+        let files = aiExchangeIndex.files.filter { $0.aiReadAllowed == true && !isAIDenied($0.id) && Self.exchangeFileExists($0, directory: aiExchangeURL) }
         let selected = Array(files.dropFirst(offset).prefix(limit))
         let next = offset + selected.count < files.count ? offset + selected.count : nil
         return SharedFilePage(items: selected.map {
@@ -1019,10 +1533,11 @@ final class TransferStore: @unchecked Sendable {
     }
 
     func aiSharedFileInfo(_ id: String) throws -> SharedFileInfo {
+        guard !isAIDenied(id) else { throw StoreError.sharedFileNotFound }
         lock.lock()
         defer { lock.unlock() }
         guard aiExchangeIndex.aiReadEnabled else { throw StoreError.aiExchangeDisabled }
-        guard let file = aiExchangeIndex.files.first(where: { $0.id == id.lowercased() }),
+        guard let file = aiExchangeIndex.files.first(where: { $0.id == id.lowercased() && $0.aiReadAllowed == true }),
               Self.exchangeFileExists(file, directory: aiExchangeURL) else { throw StoreError.sharedFileNotFound }
         let extensionName = URL(fileURLWithPath: file.name).pathExtension.lowercased()
         let readable = Self.isTextFile(name: file.name, mimeType: file.mimeType)
@@ -1033,11 +1548,17 @@ final class TransferStore: @unchecked Sendable {
     }
 
     func readAIExchangeFile(_ id: String, offset: Int64, limit: Int) throws -> SharedFileChunk {
+        let key = id.lowercased()
+        try requireAIRead(key)
         lock.lock()
-        defer { lock.unlock() }
-        guard aiExchangeIndex.aiReadEnabled else { throw StoreError.aiExchangeDisabled }
-        guard let file = aiExchangeIndex.files.first(where: { $0.id == id.lowercased() }),
-              Self.isTextFile(name: file.name, mimeType: file.mimeType) else { throw StoreError.sharedFileNotFound }
+        let candidate = aiExchangeIndex.files.first { $0.id == key }
+        lock.unlock()
+        guard let file = candidate, Self.isTextFile(name: file.name, mimeType: file.mimeType) else {
+            throw StoreError.sharedFileNotFound
+        }
+        func clearVerification() {
+            lock.lock(); verifiedExchangeFiles.removeValue(forKey: file.id); lock.unlock()
+        }
         guard offset >= 0, offset <= file.size, limit > 0, limit <= 32768 else {
             throw StoreError.invalidSharedFileRange
         }
@@ -1048,22 +1569,25 @@ final class TransferStore: @unchecked Sendable {
         defer { close(descriptor) }
         var info = stat()
         guard fstat(descriptor, &info) == 0, Self.validExchangeFile(info, size: file.size) else {
-            verifiedExchangeFiles.removeValue(forKey: file.id)
+            clearVerification()
             throw StoreError.sharedFileUnavailable
         }
         let fingerprint = Self.exchangeFingerprint(info)
-        if verifiedExchangeFiles[file.id] != fingerprint {
-            guard try Self.sha256(descriptor) == file.sha256 else {
-                verifiedExchangeFiles.removeValue(forKey: file.id)
+        lock.lock()
+        let cached = verifiedExchangeFiles[file.id]
+        lock.unlock()
+        if cached != fingerprint {
+            guard try Self.sha256(descriptor, checkpoint: { try self.requireAIRead(file.id) }) == file.sha256 else {
+                clearVerification()
                 throw StoreError.sharedFileUnavailable
             }
             var afterHash = stat()
             guard fstat(descriptor, &afterHash) == 0,
                   Self.exchangeFingerprint(afterHash) == fingerprint else {
-                verifiedExchangeFiles.removeValue(forKey: file.id)
+                clearVerification()
                 throw StoreError.sharedFileUnavailable
             }
-            verifiedExchangeFiles[file.id] = fingerprint
+            lock.lock(); verifiedExchangeFiles[file.id] = fingerprint; lock.unlock()
         }
         let amount = min(limit, Int(file.size - offset))
         var bytes = [UInt8](repeating: 0, count: amount)
@@ -1072,7 +1596,7 @@ final class TransferStore: @unchecked Sendable {
         var afterRead = stat()
         guard fstat(descriptor, &afterRead) == 0,
               Self.exchangeFingerprint(afterRead) == fingerprint else {
-            verifiedExchangeFiles.removeValue(forKey: file.id)
+            clearVerification()
             throw StoreError.sharedFileUnavailable
         }
         let data = Data(bytes.prefix(max(0, count)))
@@ -1080,19 +1604,19 @@ final class TransferStore: @unchecked Sendable {
         let (content, bytesRead) = try Self.decodeUTF8Chunk(data)
         guard offset == file.size || bytesRead > 0 else { throw StoreError.invalidSharedFileRange }
         let next = offset + Int64(bytesRead)
+        try requireAIRead(file.id)
         return SharedFileChunk(id: file.id, content: content, offset: offset, nextOffset: next,
                                bytesRead: bytesRead, sizeBytes: file.size, hasMore: next < file.size)
     }
 
-    private func registerAIExchangeFileLocked(name: String, mimeType: String, data: Data? = nil,
-                                              sourceURL: URL? = nil, expectedSize: Int64? = nil,
-                                              expectedSHA256: String? = nil) throws -> AIExchangeFile {
+    private func registerAIExchangeFile(name: String, mimeType: String, data: Data? = nil,
+                                        sourceURL: URL? = nil, expectedSize: Int64? = nil,
+                                        expectedSHA256: String? = nil, sourceItemID: String? = nil,
+                                        preparation: AIReadPreparation? = nil,
+                                        progress: (Double) -> Void = { _ in }) throws -> AIExchangeFile {
         let directory = try openAIExchangeDirectory()
         defer { close(directory) }
         var id = UUID().uuidString.lowercased()
-        while aiExchangeIndex.retiredIDs.contains(id) || aiExchangeIndex.files.contains(where: { $0.id == id }) {
-            id = UUID().uuidString.lowercased()
-        }
         let temporaryName = ".partial-\(UUID().uuidString.lowercased())"
         let target = openat(directory, temporaryName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
         guard target >= 0 else { throw StoreError.cannotCreateFile }
@@ -1121,6 +1645,7 @@ final class TransferStore: @unchecked Sendable {
         } else {
             var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
             while true {
+                try preparation?.check()
                 let count = read(source, &buffer, buffer.count)
                 if count < 0 && errno == EINTR { continue }
                 guard count >= 0 else { throw StoreError.sharedFileUnavailable }
@@ -1130,6 +1655,7 @@ final class TransferStore: @unchecked Sendable {
                 let bytes = Data(buffer.prefix(count))
                 try Self.writeAll(bytes, to: target)
                 digest.update(data: bytes)
+                if let expectedSize { progress(expectedSize == 0 ? 0.5 : 0.5 * Double(size) / Double(expectedSize)) }
             }
         }
         let checksum = digest.finalize().map { String(format: "%02x", $0) }.joined()
@@ -1143,23 +1669,44 @@ final class TransferStore: @unchecked Sendable {
         guard fstat(verification, &stagedInfo) == 0,
               stagedInfo.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
               Int64(stagedInfo.st_size) == size,
-              try Self.sha256(verification) == checksum else { throw StoreError.checksumMismatch }
-        guard linkat(directory, temporaryName, directory, id, 0) == 0 else { throw StoreError.exchangeUnavailable }
-        guard unlinkat(directory, temporaryName, 0) == 0 else {
-            _ = unlinkat(directory, id, 0)
-            throw StoreError.exchangeUnavailable
+              try Self.sha256(verification, checkpoint: { try preparation?.check() }, progress: {
+                  progress(size == 0 ? 1 : 0.5 + 0.5 * Double($0) / Double(size))
+              }) == checksum else { throw StoreError.checksumMismatch }
+        func commit() throws -> AIExchangeFile {
+            lock.lock()
+            defer { lock.unlock() }
+            aiPermissionLock.lock()
+            defer { aiPermissionLock.unlock() }
+            if let preparation { try validateAIPreparationLocked(preparation) }
+            if let sourceItemID, !items.contains(where: { $0.id == sourceItemID }) {
+                throw StoreError.itemNotInInbox
+            }
+            while aiExchangeIndex.retiredIDs.contains(id) || aiExchangeIndex.files.contains(where: { $0.id == id }) {
+                id = UUID().uuidString.lowercased()
+            }
+            guard linkat(directory, temporaryName, directory, id, 0) == 0 else { throw StoreError.exchangeUnavailable }
+            guard unlinkat(directory, temporaryName, 0) == 0 else {
+                _ = unlinkat(directory, id, 0)
+                throw StoreError.exchangeUnavailable
+            }
+            keepTemporary = false
+            let file = AIExchangeFile(id: id, name: Self.safeExchangeName(name), mimeType: mimeType,
+                                      size: size, sha256: checksum, createdAt: Date(),
+                                      aiReadAllowed: preparation != nil, sourceItemID: sourceItemID)
+            aiExchangeIndex.files.insert(file, at: 0)
+            do { try persistAIExchangeIndexLocked() }
+            catch {
+                aiExchangeIndex.files.removeAll { $0.id == id }
+                _ = unlinkat(directory, id, 0)
+                throw StoreError.exchangeUnavailable
+            }
+            aiReadSources[id] = sourceItemID ?? id
+            if preparation != nil, fstat(verification, &stagedInfo) == 0 {
+                verifiedExchangeFiles[id] = Self.exchangeFingerprint(stagedInfo)
+            }
+            return file
         }
-        keepTemporary = false
-        let file = AIExchangeFile(id: id, name: Self.safeExchangeName(name), mimeType: mimeType,
-                                  size: size, sha256: checksum, createdAt: Date())
-        aiExchangeIndex.files.insert(file, at: 0)
-        do { try persistAIExchangeIndexLocked() }
-        catch {
-            aiExchangeIndex.files.removeAll { $0.id == id }
-            _ = unlinkat(directory, id, 0)
-            throw StoreError.exchangeUnavailable
-        }
-        return file
+        return try preparation.map { try $0.commit(commit) } ?? commit()
     }
 
     private func persistAIExchangeIndexLocked() throws {
@@ -1241,22 +1788,33 @@ final class TransferStore: @unchecked Sendable {
             $0.size >= 0 && $0.size <= maximumItemSize &&
             $0.sha256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil &&
             $0.name == safeExchangeName($0.name) && !$0.mimeType.isEmpty &&
-            $0.mimeType.utf8.count <= 512 && !$0.mimeType.contains("\0")
+            $0.mimeType.utf8.count <= 512 && !$0.mimeType.contains("\0") &&
+            ($0.sourceItemID == nil || UUID(uuidString: $0.sourceItemID!) != nil)
+        } && index.phoneIntents.allSatisfy { key, request in
+            key == request.id && UUID(uuidString: key) != nil && key == key.lowercased() && request.revision > 0 &&
+            (request.sourceID == nil || UUID(uuidString: request.sourceID!) != nil) &&
+            (request.sha256 == nil || request.sha256!.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil) &&
+            (!request.allowed || request.sourceID != nil && request.sha256 != nil)
         } && index.retiredIDs.allSatisfy {
             UUID(uuidString: $0) != nil && $0 == $0.lowercased() && !ids.contains($0)
         }
     }
 
-    private static func sha256(_ descriptor: Int32) throws -> String {
+    private static func sha256(_ descriptor: Int32, checkpoint: () throws -> Void = {},
+                               progress: (Int64) -> Void = { _ in }) throws -> String {
         guard lseek(descriptor, 0, SEEK_SET) >= 0 else { throw StoreError.sharedFileUnavailable }
         var digest = SHA256()
         var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
+        var total: Int64 = 0
         while true {
+            try checkpoint()
             let count = read(descriptor, &buffer, buffer.count)
             if count < 0 && errno == EINTR { continue }
             guard count >= 0 else { throw StoreError.sharedFileUnavailable }
             if count == 0 { break }
             digest.update(data: Data(buffer.prefix(count)))
+            total += Int64(count)
+            progress(total)
         }
         return digest.finalize().map { String(format: "%02x", $0) }.joined()
     }
@@ -1364,10 +1922,30 @@ final class TransferStore: @unchecked Sendable {
         return values.isDirectory == true && values.isSymbolicLink != true
     }
 
+    // Delivery receipts never remove a file retained in the Mac library.
+    private func finishLibraryPhoneDeliveryLocked(_ id: String) throws -> Bool {
+        if let index = items.firstIndex(where: { $0.id == id && $0.phoneDeliveryPending != nil }) {
+            let previous = items[index]
+            items[index].phoneDeliveryPending = false
+            do { try persist() }
+            catch { items[index] = previous; throw error }
+            return true
+        }
+        if let index = aiExchangeIndex.files.firstIndex(where: { $0.id == id && $0.sourceItemID == nil }) {
+            let previous = aiExchangeIndex.files[index]
+            aiExchangeIndex.files[index].phoneDeliveryPending = false
+            do { try persistAIExchangeIndexLocked() }
+            catch { aiExchangeIndex.files[index] = previous; throw error }
+            return true
+        }
+        return false
+    }
+
     @discardableResult
     func acknowledge(_ id: String) throws -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        if try finishLibraryPhoneDeliveryLocked(id) { return true }
         guard let index = items.firstIndex(where: { $0.id == id && $0.origin == "mac" }) else { return true }
         let previous = items[index]
         items.remove(at: index)
@@ -1454,6 +2032,7 @@ final class TransferStore: @unchecked Sendable {
         case invalidSharedFileEncoding
         case invalidExchangeInput
         case aiExchangeDisabled
+        case aiPreparationWaiting
         case exchangeUnavailable
         case exchangeDeleteFailed
 
@@ -1476,10 +2055,21 @@ final class TransferStore: @unchecked Sendable {
             case .invalidSharedFileRange: return "파일 읽기 offset 또는 limit이 올바르지 않습니다"
             case .invalidSharedFileEncoding: return "파일이 올바른 UTF-8 텍스트가 아닙니다"
             case .invalidExchangeInput: return "교환 파일 입력이 올바르지 않습니다"
+            case .aiPreparationWaiting: return "AI 공개 유예 시간이 아직 끝나지 않았습니다"
             case .aiExchangeDisabled: return "AI Exchange 읽기가 꺼져 있습니다"
             case .exchangeUnavailable: return "AI Exchange를 안전하게 사용할 수 없습니다"
             case .exchangeDeleteFailed: return "AI Exchange 파일을 삭제하지 못했습니다"
             }
         }
+    }
+}
+
+struct LibraryArrivalTracker {
+    private var seen: Set<String>?
+
+    mutating func update(_ ids: Set<String>) -> Bool {
+        defer { seen = (seen ?? []).union(ids) }
+        guard let seen else { return false }
+        return !ids.subtracting(seen).isEmpty
     }
 }

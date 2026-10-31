@@ -122,6 +122,7 @@ final class TransferJobs: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard var job = jobs[id] else { throw JobError.notFound }
+        guard !job.terminal else { return }
         body(&job)
         job.updatedAt = now()
         saveLocked(job)
@@ -179,7 +180,8 @@ final class TransferJobs: @unchecked Sendable {
                         let filename = request.filename ?? "file"
                         let ext = URL(fileURLWithPath: filename).pathExtension
                         let mimeType = UTType(filenameExtension: ext)?.preferredMIMEType ?? "text/plain"
-                        _ = try store.receiveFileData(Data((request.content ?? "").utf8), name: filename, mimeType: mimeType)
+                        _ = try store.receiveFileData(Data((request.content ?? "").utf8), name: filename,
+                                                      mimeType: mimeType, phoneDeliveryPending: true)
                     case .sendFiles, .importFiles:
                         let url = URL(fileURLWithPath: target)
                         let attributes = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
@@ -204,7 +206,7 @@ final class TransferJobs: @unchecked Sendable {
             }
             try update(id) {
                 if $0.status == "cancelled" { return }
-                if $0.completed < $0.total {
+                if $0.status == "cancelling" || $0.completed < $0.total {
                     $0.status = "cancelled"
                 } else if $0.failures.isEmpty {
                     $0.status = "succeeded"
@@ -214,10 +216,12 @@ final class TransferJobs: @unchecked Sendable {
             }
         } catch {
             lock.lock()
-            if var job = jobs[id] {
-                job.status = "failed"
+            if var job = jobs[id], !job.terminal {
+                job.status = job.status == "cancelling" ? "cancelled" : "failed"
                 job.updatedAt = now()
-                job.failures.append(.init(target: id, error: error.localizedDescription))
+                if job.status == "failed" {
+                    job.failures.append(.init(target: id, error: error.localizedDescription))
+                }
                 saveLocked(job)
             }
             lock.unlock()

@@ -62,6 +62,9 @@ struct InboxStorageRegression {
         let accepted = try store.acceptReceivedItem(first.id)
         try check(try Data(contentsOf: URL(fileURLWithPath: accepted.savedPath!)) == content)
         assert(!fm.fileExists(atPath: current.appendingPathComponent(first.id).path))
+        try store.cancelReceivedItem(accepted.id)
+        assert(!store.savedReceivedItems().contains { $0.id == accepted.id })
+        try check(try Data(contentsOf: URL(fileURLWithPath: accepted.savedPath!)) == content)
         print("PASS new receipts use selected folder; inbox deletion deletes real file; acceptance preserves saved file")
 
         let pending = try store.receiveFileData(Data("rollback".utf8), name: "pending.txt", mimeType: "text/plain")

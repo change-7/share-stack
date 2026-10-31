@@ -35,7 +35,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
     private var outsideClickMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        popover.contentSize = NSSize(width: 360, height: 540)
+        popover.contentSize = NSSize(width: 360, height: 488)
         popover.behavior = .applicationDefined
         popover.animates = false
 
@@ -47,7 +47,22 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
             button.action = #selector(togglePopover)
         }
         statusItem = item
-        badgeSubscription = model.$inboxItems
+        model.filesArrivedHandler = { [weak self] in
+            guard let self else { return }
+            if UserDefaults.standard.object(forKey: "arrivalSound") as? Bool ?? true {
+                NSSound(named: NSSound.Name("Glass"))?.play()
+            }
+            if UserDefaults.standard.object(forKey: "arrivalShowLibrary") as? Bool ?? true {
+                self.preparePopoverContent()
+                self.model.menuSection = 0
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                if !self.popover.isShown, let button = self.statusItem?.button {
+                    self.popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+                }
+                self.popover.contentViewController?.view.window?.makeKey()
+            }
+        }
+        badgeSubscription = model.$libraryItems
             .map { $0.count }
             .removeDuplicates()
             .sink { [weak self] count in self?.updateBadge(count) }
@@ -108,7 +123,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         }
         image.isTemplate = true
         button.image = image
-        button.toolTip = count > 0 ? "Share Stack · 수신 대기 \(count)개" : "Share Stack"
+        button.toolTip = count > 0 ? "Share Stack · 보관함 \(count)개" : "Share Stack"
         button.setAccessibilityLabel(button.toolTip)
     }
 
@@ -136,6 +151,9 @@ final class MacAppModel: ObservableObject {
     @Published var inboxItems: [TransferItem] = []
     @Published var savedReceivedItems: [TransferItem] = []
     @Published var aiExchangeItems: [AIExchangeFile] = []
+    @Published var libraryItems: [LibraryItem] = []
+    @Published var aiReadProgress: [String: Double] = [:]
+    @Published private var aiReadOverrides: [String: Bool] = [:]
     @Published var aiExchangeEnabled = true
     @Published var receiptSettings = ReceiptSettings()
     @Published var receiptMessage = ""
@@ -167,6 +185,17 @@ final class MacAppModel: ObservableObject {
         return components.url?.absoluteString
     }
 
+    private var aiReadIntents: [String: AIReadPreparation] = [:]
+    private var aiReadPending = Set<String>()
+    private var aiReadTasks: [String: Task<Void, Never>] = [:]
+    private var locallyRevokedAIIDs = Set<String>()
+    private let aiPreparationQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.pdg.sharestack.ai-preparation"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
     private var store: TransferStore?
     private var server: TransferHTTPServer?
     private var isRefreshing = false
@@ -224,6 +253,9 @@ final class MacAppModel: ObservableObject {
         }
     }
 
+    var filesArrivedHandler: (() -> Void)?
+    private var arrivalTracker = LibraryArrivalTracker()
+
     func refresh() {
         guard !isRefreshing else { refreshRequested = true; return }
         isRefreshing = true
@@ -241,6 +273,13 @@ final class MacAppModel: ObservableObject {
                 if self.savedReceivedItems != savedReceivedItems { self.savedReceivedItems = savedReceivedItems }
                 if self.aiExchangeItems != exchangeItems { self.aiExchangeItems = exchangeItems }
                 if self.aiExchangeEnabled != exchangeEnabled { self.aiExchangeEnabled = exchangeEnabled }
+                self.aiReadOverrides = self.aiReadOverrides.filter { self.aiReadPending.contains($0.key) }
+                let pendingFileIDs = Set(self.libraryItems.filter { self.aiReadPending.contains($0.id) }.compactMap { $0.exchange?.id })
+                self.locallyRevokedAIIDs.formIntersection(pendingFileIDs)
+                self.rebuildLibrary()
+                if self.arrivalTracker.update(Set(self.libraryItems.map(\.id))) {
+                    self.filesArrivedHandler?()
+                }
                 self.isRefreshing = false
                 if self.refreshRequested {
                     self.refreshRequested = false
@@ -349,14 +388,17 @@ final class MacAppModel: ObservableObject {
 
     func cancelInboxItem(_ item: TransferItem) {
         guard let store, !isReceiving else { return }
+        if let row = libraryItems.first(where: { $0.id == item.id }) { setAIReadAllowed(false, for: row) }
         isReceiving = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = Result { try store.cancelReceivedItem(item.id) }
+            let result = Result {
+                try store.cancelReceivedItem(item.id)
+            }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isReceiving = false
                 switch result {
-                case .success: self.receiptMessage = "취소됨 · 임시 파일을 삭제했습니다."
+                case .success: self.receiptMessage = item.state == "saved" ? "보관함에서 제거됨 · 저장된 파일은 유지됩니다." : "취소됨 · 임시 파일을 삭제했습니다."
                 case .failure(let error): self.receiptMessage = "취소 실패 · \(error.localizedDescription)"
                 }
                 self.refresh()
@@ -364,19 +406,113 @@ final class MacAppModel: ObservableObject {
         }
     }
 
-    func addInboxItemToAIExchange(_ item: TransferItem) {
-        guard let store, !isReceiving else { return }
-        isReceiving = true
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = Result { try store.addInboxFileToAIExchange(item.id) }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.isReceiving = false
-                switch result {
-                case .success(let file): self.receiptMessage = "AI Exchange에 복사됨 · \(file.name)"
-                case .failure(let error): self.receiptMessage = "AI Exchange 등록 실패 · \(error.localizedDescription)"
+    private func rebuildLibrary() {
+        let rows = LibraryItem.combine(inbox: inboxItems, saved: savedReceivedItems, exchange: aiExchangeItems)
+        if libraryItems != rows { libraryItems = rows }
+        let liveIDs = Set(rows.map(\.id))
+        aiReadOverrides = aiReadOverrides.filter { liveIDs.contains($0.key) }
+        for id in Array(aiReadIntents.keys) where !liveIDs.contains(id) {
+            if aiReadProgress[id] != nil { aiReadIntents[id]?.cancel() }
+            aiReadIntents.removeValue(forKey: id)
+            aiReadTasks.removeValue(forKey: id)?.cancel()
+            aiReadProgress.removeValue(forKey: id)
+        }
+    }
+
+    func aiReadChecked(_ item: LibraryItem) -> Bool {
+        if let progress = aiReadProgress[item.id], progress < 1 { return false }
+        if let allowed = aiReadOverrides[item.id] { return allowed }
+        return item.exchange.map {
+            $0.aiReadAllowed == true && !locallyRevokedAIIDs.contains($0.id)
+        } ?? false
+    }
+
+    func setAIReadAllowed(_ enabled: Bool, for item: LibraryItem) {
+        guard let store else { return }
+        let committedID = aiReadIntents[item.id]?.cancel()
+        aiReadTasks.removeValue(forKey: item.id)?.cancel()
+        let fileID = committedID ?? item.exchange?.id
+        let preparation = store.makeAIReadPreparation(sourceID: item.transfer?.id, fileID: fileID)
+        aiReadIntents[item.id] = preparation
+        aiReadPending.insert(item.id)
+        if !enabled {
+            if let sourceID = item.transfer?.id { store.invalidateAIReadPreparation(sourceID: sourceID) }
+            aiReadOverrides[item.id] = false
+            aiReadProgress.removeValue(forKey: item.id)
+            if let fileID {
+                locallyRevokedAIIDs.insert(fileID)
+                store.denyAIReadImmediately(fileID)
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let result = Result {
+                    try preparation.check()
+                    if let sourceID = item.transfer?.id { try store.revokePhoneConsentFromMac(sourceID: sourceID, preparation: preparation) }
+                    if let fileID {
+                        do { try store.revokeAIRead(fileID, preparation: preparation) }
+                        catch TransferStore.StoreError.sharedFileNotFound {}
+                    }
                 }
-                self.refresh()
+                DispatchQueue.main.async {
+                    guard let self, self.aiReadIntents[item.id] === preparation else { return }
+                    self.aiReadPending.remove(item.id)
+                    if case .failure(let error) = result, !(error is CancellationError) {
+                        self.receiptMessage = "AI 읽기는 차단됐으나 설정 저장 실패 · \(error.localizedDescription)"
+                    } else { self.receiptMessage = "AI 읽기 허용을 해제했습니다." }
+                    self.refresh()
+                }
+            }
+            return
+        }
+        aiReadProgress[item.id] = 0
+        withAnimation(.linear(duration: AIReadPreparation.delay)) { aiReadProgress[item.id] = 0.8 }
+        aiReadTasks[item.id] = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(AIReadPreparation.delay * 1_000_000_000))
+                try preparation.check()
+            } catch { return }
+            guard let self, self.aiReadIntents[item.id] === preparation else { return }
+            self.aiPreparationQueue.addOperation { [weak self] in
+                var lastPercent = -1
+                let result = Result {
+                    try store.prepareAIRead(sourceID: item.transfer?.id, fileID: fileID, preparation: preparation) { value in
+                        let percent = Int(min(1, max(0, value)) * 100)
+                        guard percent > lastPercent else { return }
+                        lastPercent = percent
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, self.aiReadIntents[item.id] === preparation,
+                                  self.aiReadProgress[item.id] != nil else { return }
+                            withAnimation(.linear(duration: 0.2)) {
+                                self.aiReadProgress[item.id] = 0.8 + 0.15 * Double(percent) / 100
+                            }
+                        }
+                    }
+                }
+                DispatchQueue.main.async {
+                    guard let self, self.aiReadIntents[item.id] === preparation else { return }
+                    self.aiReadTasks.removeValue(forKey: item.id)
+                    self.aiReadPending.remove(item.id)
+                    switch result {
+                    case .success(let file):
+                        self.aiReadOverrides[item.id] = true
+                        withAnimation(.linear(duration: 0.2)) { self.aiReadProgress[item.id] = 1 }
+                        self.aiReadTasks[item.id] = Task { [weak self] in
+                            try? await Task.sleep(nanoseconds: 250_000_000)
+                            guard let self, self.aiReadIntents[item.id] === preparation else { return }
+                            self.aiReadProgress.removeValue(forKey: item.id)
+                            self.aiReadTasks.removeValue(forKey: item.id)
+                        }
+                        self.locallyRevokedAIIDs.remove(file.id)
+                        self.aiExchangeItems.removeAll { $0.id == file.id }
+                        self.aiExchangeItems.insert(file, at: 0)
+                        self.rebuildLibrary()
+                        self.receiptMessage = "AI 읽기를 허용했습니다 · \(file.name)"
+                    case .failure(let error):
+                        self.aiReadOverrides[item.id] = false
+                        self.aiReadProgress.removeValue(forKey: item.id)
+                        if !(error is CancellationError) { self.receiptMessage = "AI 공개 준비 실패 · \(error.localizedDescription)" }
+                    }
+                    self.refresh()
+                }
             }
         }
     }
@@ -399,6 +535,7 @@ final class MacAppModel: ObservableObject {
 
     func deleteAIExchangeItem(_ item: AIExchangeFile) {
         guard let store, !isReceiving else { return }
+        if let row = libraryItems.first(where: { $0.id == item.id }) { setAIReadAllowed(false, for: row) }
         isReceiving = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = Result { try store.deleteAIExchangeFile(item.id) }
@@ -430,12 +567,11 @@ final class MacAppModel: ObservableObject {
         }
     }
 
-    func addClipboardText() {
-        guard let store, let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
-            status = "클립보드에 텍스트가 없음"
-            return
+    func sendSelectedToGalaxy(_ ids: Set<String>) {
+        guard let store, !ids.isEmpty else { return }
+        enqueueForGalaxy {
+            for id in ids { try store.queueLibraryItemForPhone(id) }
         }
-        enqueueForGalaxy { _ = try store.enqueueText(text) }
     }
 
     private func enqueueForGalaxy(_ work: @escaping () throws -> Void) {
@@ -472,34 +608,27 @@ private struct ShareStackMenu: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                StackBrandMark()
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Share Stack")
-                        .font(.system(size: 20, weight: .semibold, design: .rounded))
-                        .tracking(-0.5)
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(hasError ? Color.orange : (model.certificateFingerprint.isEmpty ? Color.secondary : StackDesign.accent))
-                            .frame(width: 5, height: 5)
-                        Text(model.status)
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    .help(model.status)
-                    .accessibilityLabel(model.status)
+            HStack(spacing: 8) {
+                Picker("메뉴", selection: $model.menuSection) {
+                    Text("보관함").tag(0)
+                    Text("연결").tag(1)
+                    Text("설정").tag(2)
                 }
-                Spacer()
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(hasError ? Color.orange : (model.certificateFingerprint.isEmpty ? Color.secondary : StackDesign.accent))
+                        .frame(width: 5, height: 5)
+                    Text(model.status)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: 110, alignment: .trailing)
+                .help(model.status)
+                .accessibilityLabel(model.status)
             }
-            Picker("메뉴", selection: $model.menuSection) {
-                Text("보관함").tag(0)
-                Text("연결").tag(1)
-                Text("설정").tag(2)
-                Text("AI Exchange").tag(3)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
 
                 VStack(alignment: .leading, spacing: 12) {
                     if model.menuSection == 0 {
@@ -558,27 +687,22 @@ private struct ShareStackMenu: View {
                     if model.menuSection == 2 {
                         ReceiptSettingsView(model: model)
                     }
-                    if model.menuSection == 3 {
-                        AIExchangeView(model: model)
-                    }
 
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             .frame(maxHeight: .infinity, alignment: .top)
 
+            if model.menuSection == 0 {
             HStack(spacing: 8) {
                 Button { model.addFiles() } label: {
                     Label("파일 보내기", systemImage: "arrow.up.doc")
-                        .frame(maxWidth: .infinity)
-                }
-                Button { model.addClipboardText() } label: {
-                    Label("텍스트 보내기", systemImage: "doc.on.clipboard")
                         .frame(maxWidth: .infinity)
                 }
             }
             .buttonStyle(.bordered)
             .controlSize(.regular)
             .disabled(model.certificateFingerprint.isEmpty || model.isReceiving)
+            }
 
             Divider()
             HStack {
@@ -591,7 +715,7 @@ private struct ShareStackMenu: View {
             .foregroundStyle(.secondary)
         }
         .padding(16)
-        .frame(width: 360, height: 540)
+        .frame(width: 360, height: 488)
         .modifier(HiddenFocusRing())
         .background(.regularMaterial)
         .tint(StackDesign.accent)

@@ -81,7 +81,7 @@ enum GUIBridge {
         throw BridgeError.message("GUI 연결 준비가 끝나지 않았습니다. 앱의 시작 오류 또는 Keychain 권한을 확인한 뒤 다시 호출하세요")
     }
 
-    static func request(_ method: String, path: String, body: Any? = nil, timeout: TimeInterval) throws -> Any {
+    static func request(_ method: String, path: String, body: Any? = nil, timeout: TimeInterval, workspaceCredential: String? = nil) throws -> Any {
         guard timeout > 0 else { throw BridgeError.message("GUI 응답 시간이 초과됐습니다. 다시 조회하세요") }
         let descriptor = try JSONDecoder().decode(Descriptor.self, from: Data(contentsOf: directory().appendingPathComponent("gui-bridge.json")))
         let token = try NetworkIdentity.existingAIMCPBearerToken()
@@ -98,6 +98,7 @@ enum GUIBridge {
         request.httpMethod = method
         request.timeoutInterval = timeout
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+        if let workspaceCredential { request.setValue(workspaceCredential, forHTTPHeaderField: "X-Workspace-Session") }
         if let body {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
